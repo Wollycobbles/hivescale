@@ -118,6 +118,38 @@
 #define MAX17048_ALERT_PERCENT 20
 #endif
 
+// MAX17048 RCOMP ("ModelGauge" compensation) tuning. RCOMP is NOT a battery
+// capacity/mAh setting -- the MAX17048 has no capacity input at all; it
+// estimates SOC purely from the cell's open-circuit voltage curve. RCOMP is
+// an empirical curve-fit constant Maxim's datasheet says to "contact Maxim
+// for instructions for optimization" on. The one documented use is
+// temperature compensation (see ENABLE_MAX17048_TEMP_COMPENSATION below); any
+// capacity-based starting point is a heuristic to be validated against a real
+// discharge test -- see docs/offgrid-firmware-notes.md.
+#ifndef MAX17048_RCOMP_DEFAULT
+#define MAX17048_RCOMP_DEFAULT 0x97
+#endif
+
+// When enabled, RCOMP is recomputed every measurement cycle from the ambient
+// temperature reading (if one was captured this cycle) using Maxim's
+// documented formula:
+//   T > 20C: RCOMP = RCOMP_DEFAULT + (T - 20) * MAX17048_RCOMP_TEMPCO_UP
+//   T <=20C: RCOMP = RCOMP_DEFAULT + (T - 20) * MAX17048_RCOMP_TEMPCO_DOWN
+// Requires an ambient sensor (SHT4x/SHT3x/BME280) to be enabled; otherwise
+// this silently no-ops and the static MAX17048_RCOMP_DEFAULT is left in
+// place.
+#ifndef ENABLE_MAX17048_TEMP_COMPENSATION
+#define ENABLE_MAX17048_TEMP_COMPENSATION 0
+#endif
+
+#ifndef MAX17048_RCOMP_TEMPCO_UP
+#define MAX17048_RCOMP_TEMPCO_UP (-0.5f)
+#endif
+
+#ifndef MAX17048_RCOMP_TEMPCO_DOWN
+#define MAX17048_RCOMP_TEMPCO_DOWN (-5.0f)
+#endif
+
 // ==============================
 // DS18B20 WIRED IN-HIVE TEMPERATURE (optional)
 // ==============================

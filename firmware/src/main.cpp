@@ -319,7 +319,25 @@ void setup() {
                      batteryGauge.begin();
   Serial.printf("[MAX17048] %s\n", batteryMonitorOk ? "OK" : "MISSING");
   if (batteryMonitorOk) {
-    batteryGauge.quickStart();
+    // Apply the configured RCOMP starting point unconditionally; if temp
+    // compensation is enabled, sensors.cpp will recompute it every cycle from
+    // the ambient temperature reading.
+    batteryGauge.setCompensation(MAX17048_RCOMP_DEFAULT);
+    // quickStart() re-seeds the gauge's SOC estimate from the instantaneous
+    // voltage and should only run on a genuine MAX17048 power-on-reset (e.g.
+    // the battery was just connected) -- NOT on every ESP32 deep-sleep wake.
+    // The gauge is powered continuously off the battery and does not reset
+    // when the ESP32 wakes, so setup() running every cycle must not
+    // unconditionally quick-start it; doing so introduces SOC error,
+    // especially under load. isReset(true) checks (and clears) the MAX17048's
+    // own RI status bit.
+    bool gaugeSawPor = batteryGauge.isReset(true);
+    Serial.printf("[MAX17048] Gauge POR detected: %s%s\n",
+                  gaugeSawPor ? "yes" : "no",
+                  gaugeSawPor ? " -- quick-starting" : " -- skipping quickStart()");
+    if (gaugeSawPor) {
+      batteryGauge.quickStart();
+    }
     batteryGauge.setThreshold(MAX17048_ALERT_PERCENT);
   }
 #endif

@@ -448,6 +448,21 @@ void prefetchAmbientSensors() {
 
 #if ENABLE_MAX17048_BATTERY
   if (batteryMonitorOk) {
+#if ENABLE_MAX17048_TEMP_COMPENSATION
+    // RCOMP is NOT a battery-capacity setting -- see config.h and
+    // docs/offgrid-firmware-notes.md. This is Maxim's documented
+    // temperature-compensation formula for the ModelGauge RCOMP parameter.
+    // Silently no-ops (leaves whatever RCOMP is already set) if no ambient
+    // temperature was captured this cycle, e.g. ambient sensor read failure.
+    if (gWired.shtRead && !isnan(gWired.ambientTemp)) {
+      float tempC = gWired.ambientTemp;
+      float tempCo = (tempC > 20.0f) ? MAX17048_RCOMP_TEMPCO_UP : MAX17048_RCOMP_TEMPCO_DOWN;
+      float rcompF = (float)MAX17048_RCOMP_DEFAULT + (tempC - 20.0f) * tempCo;
+      if (rcompF < 0.0f) rcompF = 0.0f;
+      if (rcompF > 255.0f) rcompF = 255.0f;
+      batteryGauge.setCompensation((uint8_t)(rcompF + 0.5f));
+    }
+#endif
     gWired.batteryVoltage = batteryGauge.getVoltage();
     // A connected LiPo never reads 0.0 V, so 0.0 means the VCELL read failed.
     if (gWired.batteryVoltage == 0.0f && i2cbus::healForRead()) {

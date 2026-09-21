@@ -57,6 +57,17 @@
 // MAX17048 LiPo fuel gauge alert threshold, in percent.
 #define MAX17048_ALERT_PERCENT   20
 
+// MAX17048 RCOMP tuning. NOT a battery capacity/mAh setting -- see
+// docs/offgrid-firmware-notes.md for the capacity-based starting-point table
+// and the discharge-test calibration procedure to validate it.
+#define MAX17048_RCOMP_DEFAULT   0x97
+
+// Recompute RCOMP each cycle from the ambient temperature reading (requires
+// an ambient sensor to be enabled; silently no-ops otherwise).
+#define ENABLE_MAX17048_TEMP_COMPENSATION 0
+#define MAX17048_RCOMP_TEMPCO_UP   (-0.5f)
+#define MAX17048_RCOMP_TEMPCO_DOWN (-5.0f)
+
 // ==============================
 // POWER / DEEP SLEEP
 // ==============================

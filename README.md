@@ -237,6 +237,16 @@ Optional sensors are enabled per build in `secrets.h`. The defaults shipped in `
 #define ENABLE_MAX17048_BATTERY  0   // LiPo fuel-gauge telemetry (default off)
 ```
 
+MAX17048-specific tuning (see [docs/offgrid-firmware-notes.md](docs/offgrid-firmware-notes.md#tuning-max17048-accuracy-with-rcomp) for the full RCOMP calibration guide — RCOMP is not a battery-capacity setting):
+
+```cpp
+#define MAX17048_ALERT_PERCENT             20     // low-battery alert threshold, in percent
+#define MAX17048_RCOMP_DEFAULT             0x97   // ModelGauge compensation starting point
+#define ENABLE_MAX17048_TEMP_COMPENSATION  0      // recompute RCOMP from ambient temp each cycle
+#define MAX17048_RCOMP_TEMPCO_UP           (-0.5f)
+#define MAX17048_RCOMP_TEMPCO_DOWN         (-5.0f)
+```
+
 The [secrets.h configurator](website/configurator.html) writes these (and the wireless-sensor macros) for you.
 
 > Cellular (SIM7080G) transport is no longer part of this firmware. LTE, solar,
