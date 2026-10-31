@@ -3,10 +3,12 @@ readings, temperature compensation and serialization."""
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
+from typing import Any, Optional
 
 import psycopg
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from auth import (
     require_api_key,
@@ -15,6 +17,7 @@ from auth import (
     require_user_id,
 )
 from config import MIN_PLAUSIBLE_YEAR, logger
+from counter_intervals import counter_restarted, interval_between, maintenance_seconds_between
 from db import get_conn
 from devices import ensure_device_config
 from hiveheart_fft import decode_fft
@@ -27,6 +30,7 @@ from inspections import (
 )
 from sd_import import split_new_and_duplicate
 from tempcomp import TEMP_SOURCE_FIELD, apply_compensation
+from uploads import parse_json_body
 
 router = APIRouter()
 
@@ -41,13 +45,13 @@ MEASUREMENT_INSERT_SQL = """
                     device_id, measurement_id, measured_at, scale_1_weight_kg, scale_2_weight_kg,
                     hive_1_temp_c, hive_2_temp_c,
                     hive_1_humidity_percent, hive_2_humidity_percent, ambient_temp_c,
-                    ambient_humidity_percent, battery_voltage, battery_soc_percent,
+                    ambient_humidity_percent, ambient_pressure_hpa, battery_voltage, battery_soc_percent,
                     battery_alert, battery_monitor_ok, solar_monitor_ok,
                     solar_bus_voltage_v, solar_shunt_voltage_mv, solar_load_voltage_v,
                     solar_current_ma, solar_power_mw, network_transport,
                     calibration_mode, boot_count,
                     time_source, rssi_dbm, firmware_version, config_version, sd_ok,
-                    rtc_ok, sht_ok, scale_1_raw, scale_2_raw,
+                    rtc_ok, sht_ok, sht_detected, scale_1_raw, scale_2_raw,
                     mic_ok, mic_sample_rate_hz, mic_sample_frames,
                     mic_left_ok, mic_left_rms_dbfs, mic_left_peak_dbfs, mic_left_rms_normalized,
                     mic_right_ok, mic_right_rms_dbfs, mic_right_peak_dbfs, mic_right_rms_normalized,
@@ -85,7 +89,7 @@ MEASUREMENT_INSERT_SQL = """
                     %(device_id)s, %(measurement_id)s, %(measured_at)s, %(scale_1_weight_kg)s,
                     %(scale_2_weight_kg)s, %(hive_1_temp_c)s, %(hive_2_temp_c)s,
                     %(hive_1_humidity_percent)s, %(hive_2_humidity_percent)s,
-                    %(ambient_temp_c)s, %(ambient_humidity_percent)s,
+                    %(ambient_temp_c)s, %(ambient_humidity_percent)s, %(ambient_pressure_hpa)s,
                     %(battery_voltage)s, %(battery_soc_percent)s,
                     %(battery_alert)s, %(battery_monitor_ok)s, %(solar_monitor_ok)s,
                     %(solar_bus_voltage_v)s, %(solar_shunt_voltage_mv)s,
@@ -93,7 +97,7 @@ MEASUREMENT_INSERT_SQL = """
                     %(solar_power_mw)s, %(network_transport)s,
                     %(calibration_mode)s, %(boot_count)s,
                     %(time_source)s, %(rssi_dbm)s, %(firmware_version)s,
-                    %(config_version)s, %(sd_ok)s, %(rtc_ok)s, %(sht_ok)s,
+                    %(config_version)s, %(sd_ok)s, %(rtc_ok)s, %(sht_ok)s, %(sht_detected)s,
                     %(scale_1_raw)s, %(scale_2_raw)s,
                     %(mic_ok)s, %(mic_sample_rate_hz)s, %(mic_sample_frames)s,
                     %(mic_left_ok)s, %(mic_left_rms_dbfs)s, %(mic_left_peak_dbfs)s, %(mic_left_rms_normalized)s,
@@ -128,6 +132,12 @@ MEASUREMENT_INSERT_SQL = """
                     %(hivescale_2_humidity_percent)s, %(hivescale_2_pressure_hpa)s, %(hivescale_2_battery_v)s,
                     %(raw_json)s
                 )"""
+# A row whose measurement_id is already stored for its device is a replay, not
+# a new reading (migration 019's partial unique index). Shared by live ingest
+# and the bulk import so the two de-duplicate on the same key.
+MEASUREMENT_ID_CONFLICT = (
+    " ON CONFLICT (device_id, measurement_id) WHERE measurement_id IS NOT NULL DO NOTHING"
+)
 
 
 def measurement_insert_params(payload: "MeasurementIn", measured_at: datetime) -> dict:
@@ -144,6 +154,7 @@ def measurement_insert_params(payload: "MeasurementIn", measured_at: datetime) -
         "hive_2_humidity_percent": payload.hive_2_humidity_percent,
         "ambient_temp_c": payload.ambient_temp_c,
         "ambient_humidity_percent": payload.ambient_humidity_percent,
+        "ambient_pressure_hpa": payload.ambient_pressure_hpa,
         "battery_voltage": payload.battery_voltage_v if payload.battery_voltage_v is not None else payload.battery_voltage,
         "battery_soc_percent": payload.battery_soc_percent,
         "battery_alert": payload.battery_alert,
@@ -164,6 +175,7 @@ def measurement_insert_params(payload: "MeasurementIn", measured_at: datetime) -
         "sd_ok": payload.sd_ok,
         "rtc_ok": payload.rtc_ok,
         "sht_ok": payload.sht_ok,
+        "sht_detected": payload.sht_detected,
         "scale_1_raw": payload.scale_1_raw,
         "scale_2_raw": payload.scale_2_raw,
         "mic_ok": payload.mic_ok,
@@ -399,6 +411,9 @@ def resolve_measured_at(
     moment of measurement.
     """
     now = now or datetime.now(timezone.utc)
+    if client_ts is not None and client_ts.tzinfo is None:
+        # MeasurementIn already does this; kept for any other caller.
+        client_ts = client_ts.replace(tzinfo=timezone.utc)
     if client_ts is not None and (
         client_ts.year >= MIN_PLAUSIBLE_YEAR and client_ts <= now + timedelta(days=1)
     ):
@@ -430,9 +445,7 @@ def create_measurement(payload: MeasurementIn, x_api_key: str = Header(default="
             # cached JSON, making response-loss retries safe.
             if payload.measurement_id:
                 cur.execute(
-                    MEASUREMENT_INSERT_SQL
-                    + " ON CONFLICT (device_id, measurement_id) WHERE measurement_id IS NOT NULL "
-                      "DO NOTHING RETURNING id;",
+                    MEASUREMENT_INSERT_SQL + MEASUREMENT_ID_CONFLICT + " RETURNING id;",
                     params,
                 )
             else:
@@ -473,6 +486,10 @@ def create_measurement(payload: MeasurementIn, x_api_key: str = Header(default="
         )
         mqtt_state["device_id"] = payload.device_id
         mqtt_state["measured_at"] = measured_at
+        # The counter reports lifetime totals only; give the advertised
+        # bee_counter_N_interval_* entities the same derived values the read
+        # APIs return. Before masking, so an inspection blanks them too.
+        attach_publish_intervals(mqtt_state)
         mqtt_state = mask_inspection_readings([mqtt_state])[0]
         mqtt_state.update(mqtt_inspection_state(payload.device_id))
         mqtt_publisher.publish_measurement(
@@ -497,10 +514,12 @@ def create_measurement(payload: MeasurementIn, x_api_key: str = Header(default="
 @router.post(
     "/api/v1/app/devices/{device_id}/measurements/import",
     dependencies=[Depends(require_hivepal_service_key)],
+    openapi_extra={"requestBody": {"required": True, "content": {"application/json": {
+        "schema": {"$ref": "#/components/schemas/MeasurementImportIn"}}}}},
 )
-def import_measurements(
+async def import_measurements(
     device_id: str,
-    payload: MeasurementImportIn,
+    request: Request,
     user_id: str = Depends(require_user_id),
 ):
     """Bulk-import measurements parsed from a device's SD card backup.
@@ -511,12 +530,15 @@ def import_measurements(
     data, since the file's ``device_id`` is attacker-controllable and ownership
     is established through the claim-code flow.
 
-    Re-importing the same file is a no-op: ``(device_id, measured_at)`` is treated
-    as the natural key and existing rows are skipped, so duplicates inside the
-    file and rows already stored are both counted and ignored.
+    Re-importing the same file is a no-op: each row's ``measurement_id`` (or
+    ``measured_at`` for legacy rows without one) is its natural key and existing
+    rows are skipped, so duplicates inside the file and rows already stored are
+    both counted and ignored.
     """
-    require_device_role(user_id, device_id, ["owner", "admin"])
-    return bulk_import_measurements(device_id, payload.measurements)
+    await run_in_threadpool(require_device_role, user_id, device_id, ["owner", "admin"])
+    # Parsed only now, once the caller is known: see uploads.py.
+    payload = await parse_json_body(request, MeasurementImportIn)
+    return await run_in_threadpool(bulk_import_measurements, device_id, payload.measurements)
 
 
 def bulk_import_measurements(
@@ -534,65 +556,88 @@ def bulk_import_measurements(
     """
     # Force the path device_id onto every row so a file cannot smuggle readings
     # in under a different device the caller may not own.
-    prepared: list[tuple[datetime, MeasurementIn]] = []
+    #
+    # Each row is de-duplicated on its stable measurement_id when it has one —
+    # the same key live ingest uses — and only falls back to measured_at when it
+    # does not (legacy rows). measured_at alone is not stable: a line recorded
+    # without a valid clock is stamped with the server time on every import, so
+    # a re-import never matched it and then ran into the measurement_id unique
+    # index, aborting the whole import. It also merged distinct readings that
+    # happened to share a timestamp.
+    prepared: list[tuple[tuple, datetime, MeasurementIn]] = []
     for measurement in measurements:
         # Clamp missing *and* implausible timestamps (e.g. the 1970 epoch a
         # no-RTC device writes into its SD cache) to the server clock, matching
         # the live-ingest path. Storing 1970 verbatim would otherwise both
         # mis-date the reading and collapse every untimed row onto one key.
         measured_at = resolve_measured_at(measurement.timestamp, device_id)
-        prepared.append(
-            (measured_at, measurement.model_copy(update={"device_id": device_id}))
-        )
+        row = measurement.model_copy(update={"device_id": device_id})
+        key = ("id", row.measurement_id) if row.measurement_id else ("at", measured_at)
+        prepared.append((key, measured_at, row))
 
-    # Keep the first record seen for each timestamp (file duplicates are identical).
-    record_by_key: dict[datetime, MeasurementIn] = {}
-    for measured_at, measurement in prepared:
-        record_by_key.setdefault(measured_at, measurement)
+    # Keep the first record seen for each key (file duplicates are identical).
+    record_by_key: dict[tuple, tuple[datetime, MeasurementIn]] = {}
+    for key, measured_at, row in prepared:
+        record_by_key.setdefault(key, (measured_at, row))
 
     received = len(measurements)
     inserted = 0
-    duplicates = 0
+    hive_rows: list[tuple[MeasurementIn, int, datetime]] = []
     with get_conn() as conn:
         with conn.cursor() as cur:
-            keys = [measured_at for measured_at, _ in prepared]
             existing: set = set()
-            unique_keys = list(record_by_key.keys())
-            if unique_keys:
+            ids = [k[1] for k in record_by_key if k[0] == "id"]
+            if ids:
+                cur.execute(
+                    "SELECT measurement_id FROM measurements "
+                    "WHERE device_id = %s AND measurement_id = ANY(%s);",
+                    (device_id, ids),
+                )
+                existing |= {("id", r[0]) for r in cur.fetchall()}
+            stamps = [k[1] for k in record_by_key if k[0] == "at"]
+            if stamps:
                 cur.execute(
                     "SELECT measured_at FROM measurements "
                     "WHERE device_id = %s AND measured_at = ANY(%s);",
-                    (device_id, unique_keys),
+                    (device_id, stamps),
                 )
-                existing = {row[0] for row in cur.fetchall()}
+                existing |= {("at", r[0]) for r in cur.fetchall()}
 
-            new_keys, duplicates = split_new_and_duplicate(keys, existing)
-            if new_keys:
-                def _params(key):
-                    p = measurement_insert_params(record_by_key[key], key)
-                    overlay_legacy_hive_columns(p, record_by_key[key])
-                    return p
+            new_keys, duplicates = split_new_and_duplicate(
+                [key for key, _, _ in prepared], existing
+            )
 
-                cur.executemany(
-                    MEASUREMENT_INSERT_SQL + ";",
-                    [_params(key) for key in new_keys],
-                )
-                inserted = len(new_keys)
+            def _params(key):
+                measured_at, row = record_by_key[key]
+                p = measurement_insert_params(row, measured_at)
+                overlay_legacy_hive_columns(p, row)
+                return p
 
-                # Fan any multi-hive payloads into hive_readings. executemany gives
-                # no ids back, so look up the rows we just inserted by their key.
-                hive_keys = [k for k in new_keys if record_by_key[k].hives]
-                if hive_keys:
-                    cur.execute(
-                        "SELECT measured_at, id FROM measurements "
-                        "WHERE device_id = %s AND measured_at = ANY(%s);",
-                        (device_id, hive_keys),
-                    )
-                    id_by_key = {row[0]: row[1] for row in cur.fetchall()}
-                    for key in hive_keys:
-                        mid = id_by_key.get(key)
-                        if mid is not None:
-                            insert_hive_readings(cur, record_by_key[key], mid, key)
+            # Rows with an id insert under the same conflict guard as live
+            # ingest, so one that lands concurrently (or was missed by the
+            # lookup above) is counted as a duplicate instead of failing the
+            # batch. RETURNING gives each new row's id for its hive readings.
+            for batch_keys, sql in (
+                ([k for k in new_keys if k[0] == "id"],
+                 MEASUREMENT_INSERT_SQL + MEASUREMENT_ID_CONFLICT + " RETURNING id;"),
+                ([k for k in new_keys if k[0] == "at"],
+                 MEASUREMENT_INSERT_SQL + " RETURNING id;"),
+            ):
+                if not batch_keys:
+                    continue
+                cur.executemany(sql, [_params(k) for k in batch_keys], returning=True)
+                for key in batch_keys:
+                    result = cur.fetchone()
+                    if result is None:
+                        duplicates += 1
+                    else:
+                        inserted += 1
+                        measured_at, row = record_by_key[key]
+                        if row.hives:
+                            hive_rows.append((row, result[0], measured_at))
+                    cur.nextset()
+            for row, measurement_pk, measured_at in hive_rows:
+                insert_hive_readings(cur, row, measurement_pk, measured_at)
             conn.commit()
 
     return {
@@ -675,6 +720,8 @@ def bulk_import_measurements(
 #  65  bee_counter_1_read_attempts134  ble_2_firmware_version
 #  66  bee_counter_1_latch_succeeded135  hiveheart_1_fft
 #  67  bee_counter_2_ok       136  hiveheart_2_fft
+#                             137  ambient_pressure_hpa
+#                             138  sht_detected
 #  68  bee_counter_2_protocol_version
 # ---------------------------------------------------------------------------
 
@@ -818,7 +865,9 @@ MEASUREMENT_SELECT_COLUMNS = """
     -- read path can decode it into fft_bins. Appended last so the positional
     -- row_to_dict indices below stay stable.
     raw_json->'hiveheart_1_fft' AS hiveheart_1_fft,
-    raw_json->'hiveheart_2_fft' AS hiveheart_2_fft
+    raw_json->'hiveheart_2_fft' AS hiveheart_2_fft,
+    ambient_pressure_hpa,
+    sht_detected
 """
 
 
@@ -847,7 +896,7 @@ CHART_MEASUREMENT_COLUMNS = """
     id, device_id, measured_at,
     scale_1_weight_kg, scale_2_weight_kg,
     hive_1_temp_c, hive_2_temp_c, ambient_temp_c,
-    ambient_humidity_percent,
+    ambient_humidity_percent, ambient_pressure_hpa,
     COALESCE(hive_1_humidity_percent, NULLIF(raw_json->>'hive_1_humidity_percent', '')::double precision) AS hive_1_humidity_percent,
     COALESCE(hive_2_humidity_percent, NULLIF(raw_json->>'hive_2_humidity_percent', '')::double precision) AS hive_2_humidity_percent,
     COALESCE(ble_1_pressure_hpa, NULLIF(raw_json->>'ble_1_pressure_hpa', '')::double precision) AS ble_1_pressure_hpa,
@@ -1055,6 +1104,8 @@ def measurement_row_to_dict(r):
         # fft_bins by attach_hive_readings → _attach_hiveheart_fft_bins.
         "hiveheart_1_fft":              r[135],
         "hiveheart_2_fft":              r[136],
+        "ambient_pressure_hpa":         r[137],
+        "sht_detected":                 r[138],
     }
 
 
@@ -1178,13 +1229,36 @@ def difference_bee_counter_intervals(measurements: list[dict]) -> list[dict]:
     * Rows where the channel was unreachable (``bee_counter_{ch}_ok`` falsy) are
       skipped and never advance the baseline, so a dead counter can't inject a
       bogus delta.
-    * A counter reboot or uint32 wrap (``total_now < total_prev``) is attributed
-      as ``total_now`` so the restart from zero is not seen as a huge negative.
+    * A counter reboot or uint32 wrap is attributed as ``total_now`` (the count
+      since the restart). A reboot is recognised by the totals going down, or
+      by the counter's ``uptime_s`` going backwards / being shorter than the
+      time since the previous sample — the latter catches a counter that
+      restarted and counted past its old total before the next poll, which the
+      totals alone read as an ordinary (far too small) interval. See
+      counter_intervals.counter_restarted.
+    * An interval in which the counter's ``maint_s`` moved overlapped a USB
+      maintenance session (totals frozen, crossings went to the test
+      counters). The derived count stays — it is what was counted outside the
+      session — and ``bee_counter_{ch}_interval_maint_s`` says how many seconds
+      of the interval were maintenance (0 = none; absent = cannot say, e.g. a
+      counter older than wire revision 6), so charts and insights can tell a
+      bench test from a quiet hive.
+    * Each device is differenced on its own: a result set spanning several hubs
+      (the master-key latest endpoint) used to difference hub A's counter against
+      hub B's. And a reading from a different counter (``bee_counter_{n}_mac``
+      changed) starts a new baseline instead of being read as a reboot, which
+      would have credited the new counter's whole lifetime total as one interval.
 
     The dicts are mutated in place; the caller's ordering is preserved (we sort a
     shallow copy by ``measured_at`` only to compute the deltas). Run this *after*
     attach_hive_readings so the flat ``bee_counter_{n}_*`` aliases exist for hives
     3–18 (which have no fixed table columns); otherwise only hives 1–2 are filled.
+
+    The derived counts are computed once, on the flat keys, and then copied into
+    the canonical nested ``hives[].bee_counter.interval_*`` as well, so a client
+    reading either shape of the same response sees the same number. (Only the
+    flat keys used to be filled, and nested consumers got null for every BLE
+    reading.)
     """
     ordered = sorted(
         (m for m in measurements if m.get("measured_at") is not None),
@@ -1192,24 +1266,181 @@ def difference_bee_counter_intervals(measurements: list[dict]) -> list[dict]:
     )
     for ch in range(1, MAX_HIVES + 1):
         ok_key = f"bee_counter_{ch}_ok"
-        for direction in ("in", "out"):
-            interval_key = f"bee_counter_{ch}_interval_{direction}"
-            total_key = f"bee_counter_{ch}_total_{direction}"
-            prev_total = None
-            for m in ordered:
-                if not m.get(ok_key):
-                    continue
-                cur_total = m.get(total_key)
-                if m.get(interval_key) is None and cur_total is not None:
-                    if prev_total is None:
-                        pass  # no baseline yet — can't attribute the first reading
-                    elif cur_total >= prev_total:
-                        m[interval_key] = cur_total - prev_total
-                    else:
-                        m[interval_key] = cur_total  # reboot / wrap
-                if cur_total is not None:
-                    prev_total = cur_total
+        mac_key = f"bee_counter_{ch}_mac"
+        uptime_key = f"bee_counter_{ch}_uptime_s"
+        maint_key = f"bee_counter_{ch}_maint_s"
+        total_keys = {d: f"bee_counter_{ch}_total_{d}" for d in ("in", "out")}
+        interval_keys = {d: f"bee_counter_{ch}_interval_{d}" for d in ("in", "out")}
+        # Per device: the previous sample of this channel's counter.
+        prev: dict = {}
+        for m in ordered:
+            if not m.get(ok_key):
+                continue
+            totals = {d: m.get(k) for d, k in total_keys.items()}
+            mac = m.get(mac_key)
+            uptime = m.get(uptime_key)
+            p = prev.get(m.get("device_id"))
+            if p is not None and mac and p["mac"] and mac != p["mac"]:
+                p = None  # a different counter: no baseline yet
+            if p is not None:
+                # One verdict for the counter, from either direction: a reset
+                # restarts both totals at once.
+                elapsed = _elapsed_seconds(p["at"], m["measured_at"])
+                restarted = any(
+                    counter_restarted(p["totals"][d], totals[d], p["uptime"], uptime, elapsed)
+                    for d in totals
+                )
+                for d, key in interval_keys.items():
+                    # (No baseline in this direction: can't attribute it.)
+                    if (m.get(key) is None and totals[d] is not None
+                            and p["totals"][d] is not None):
+                        m[key] = interval_between(p["totals"][d], totals[d], restarted)
+                maint = maintenance_seconds_between(p["maint"], m.get(maint_key), restarted)
+                if maint is not None:
+                    m[f"bee_counter_{ch}_interval_maint_s"] = maint
+            if any(t is not None for t in totals.values()):
+                prev[m.get("device_id")] = {
+                    "totals": {d: totals[d] if totals[d] is not None
+                               else (p["totals"][d] if p else None) for d in totals},
+                    "mac": mac or (p["mac"] if p else None),
+                    "uptime": uptime, "maint": m.get(maint_key), "at": m["measured_at"],
+                }
+    for m in measurements:
+        _copy_intervals_to_nested(m)
     return measurements
+
+
+def _copy_intervals_to_nested(m: dict) -> None:
+    """Mirror the flat ``bee_counter_{n}_interval_*`` into ``hives[n].bee_counter``.
+
+    Only fills a nested value that is missing: a device-reported interval (wired
+    history) is already in both places and stays as it was.
+    """
+    for h in m.get("hives") or []:
+        n = h.get("index")
+        bc = h.get("bee_counter")
+        if not n or not isinstance(bc, dict):
+            continue
+        for key in ("interval_in", "interval_out", "interval_maint_s"):
+            flat = m.get(f"bee_counter_{n}_{key}")
+            if bc.get(key) is None and flat is not None:
+                bc[key] = flat
+
+
+def _elapsed_seconds(earlier, later) -> Optional[float]:
+    """Seconds between two measured_at values, or None if either is not a datetime."""
+    if isinstance(earlier, datetime) and isinstance(later, datetime):
+        try:
+            return (later - earlier).total_seconds()
+        except TypeError:  # naive vs aware
+            return None
+    return None
+
+
+# The last successful reading of each of a device's counters strictly before a
+# given time, from hive_readings' (device_id, hive_index, measured_at DESC)
+# index. A week back is plenty: a counter silent for longer than that has no
+# interval worth attributing to one upload.
+COUNTER_BASELINE_SQL = """
+    SELECT DISTINCT ON (hive_index) hive_index, measured_at,
+           bee_counter_total_in, bee_counter_total_out, raw_json
+    FROM hive_readings
+    WHERE device_id = %s AND hive_index = ANY(%s)
+      AND measured_at < %s AND measured_at >= %s
+      AND bee_counter_ok
+    ORDER BY hive_index, measured_at DESC
+"""
+
+# Counters that already have a successful reading AFTER the one being
+# published: an SD-cache line replayed late. Its interval is already contained
+# in the one published for that newer reading, so publishing it as well would
+# count the same bees twice in anything that sums the entity.
+COUNTER_NEWER_SQL = """
+    SELECT DISTINCT hive_index FROM hive_readings
+    WHERE device_id = %s AND hive_index = ANY(%s) AND measured_at > %s
+      AND bee_counter_ok
+"""
+
+
+def publish_intervals(state: dict, baselines: dict[int, dict],
+                      newer: set[int]) -> dict[int, dict]:
+    """Derive the per-interval counts of one just-stored reading for publishing.
+
+    ``state`` is the reading (``device_id``, ``measured_at``, ``hives[]``);
+    ``baselines`` maps hive index -> the previous successful reading of that
+    counter (``measured_at``, ``bee_counter`` dict); ``newer`` the hive indices
+    whose counter already has a later reading. Runs the very differencing the
+    read APIs use (difference_bee_counter_intervals: same reset, MAC and
+    maintenance rules), so MQTT and the API cannot disagree, and keys the
+    baseline on stored history by measured_at rather than on arrival order — a
+    publisher restart, a duplicate upload (never published) or a late replay
+    cannot shift it. Returns hive index -> {interval_in, interval_out,
+    interval_maint_s} for the hives that got a value.
+    """
+    device_id = state.get("device_id")
+    cur = {"device_id": device_id, "measured_at": state.get("measured_at")}
+    rows = [cur]
+    for h in state.get("hives") or []:
+        n = h.get("index")
+        if not isinstance(n, int) or n in newer or n not in baselines:
+            continue
+        bc = h.get("bee_counter") or {}
+        if not bc.get("ok"):
+            continue
+        _flatten_hive_to_measurement(cur, {"index": n, "bee_counter": bc})
+        base = baselines[n]
+        prev = {"device_id": device_id, "measured_at": base["measured_at"]}
+        _flatten_hive_to_measurement(prev, {"index": n, "bee_counter": base["bee_counter"]})
+        rows.append(prev)
+    if len(rows) == 1:
+        return {}
+    difference_bee_counter_intervals(rows)
+    out: dict[int, dict] = {}
+    for n in baselines:
+        vals = {k: cur.get(f"bee_counter_{n}_{k}")
+                for k in ("interval_in", "interval_out", "interval_maint_s")}
+        vals = {k: v for k, v in vals.items() if v is not None}
+        if vals:
+            out[n] = vals
+    return out
+
+
+def attach_publish_intervals(state: dict) -> None:
+    """Fill hives[].bee_counter.interval_* on a just-stored reading (fail-soft).
+
+    Used for the MQTT bridge, whose Home Assistant discovery advertises
+    per-interval entities: the live payload carries lifetime totals only, and
+    the bridge's flattener copies an interval only if one is there.
+    """
+    hives = [h for h in state.get("hives") or []
+             if isinstance(h.get("index"), int) and (h.get("bee_counter") or {}).get("ok")]
+    if not hives:
+        return
+    idx = [h["index"] for h in hives]
+    at = state["measured_at"]
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(COUNTER_BASELINE_SQL,
+                            (state["device_id"], idx, at, at - timedelta(days=7)))
+                baselines = {
+                    r[0]: {"measured_at": r[1],
+                           "bee_counter": {**(_json_obj(r[4]).get("bee_counter") or {}),
+                                           "ok": True, "total_in": r[2], "total_out": r[3]}}
+                    for r in cur.fetchall()
+                }
+                cur.execute(COUNTER_NEWER_SQL, (state["device_id"], idx, at))
+                newer = {r[0] for r in cur.fetchall()}
+    except Exception:
+        logger.exception("Could not derive bee-counter intervals for MQTT (%s)",
+                         state.get("device_id"))
+        return
+    derived = publish_intervals(state, baselines, newer)
+    for h in hives:
+        for k, v in derived.get(h["index"], {}).items():
+            h["bee_counter"].setdefault(k, None)
+            if h["bee_counter"][k] is None:
+                h["bee_counter"][k] = v
 
 
 HIVE_READINGS_SELECT = """
@@ -1448,6 +1679,24 @@ def _flatten_hive_to_measurement(m: dict, h: dict) -> None:
         put(f"bee_counter_{n}_total_out", c.get("total_out"))
         put(f"bee_counter_{n}_interval_in", c.get("interval_in"))
         put(f"bee_counter_{n}_interval_out", c.get("interval_out"))
+        # Which physical counter this is: a different one starts a new count.
+        put(f"bee_counter_{n}_mac", c.get("mac"))
+        # What it covers, and whether it was idled for the night (see the
+        # HiveBeeCounterIn notes in schemas.py). The insight engine compares
+        # traffic only within one coverage and skips idle readings.
+        put(f"bee_counter_{n}_banks", c.get("banks"))
+        put(f"bee_counter_{n}_mcps_healthy",
+            c.get("mcps_healthy") if c.get("mcps_healthy") is not None else c.get("gates_healthy"))
+        put(f"bee_counter_{n}_num_gates", c.get("num_gates"))
+        put(f"bee_counter_{n}_idle_s", c.get("idle_s"))
+        # The counter's uptime: the differencing reads a restart from it.
+        put(f"bee_counter_{n}_uptime_s", c.get("uptime_s"))
+        # Lifetime USB-maintenance seconds (wire revision 6): the differencing
+        # marks the intervals it moved in.
+        put(f"bee_counter_{n}_maint_s", c.get("maint_s"))
+        # False when the hub's read rotation did not dial this counter this
+        # cycle (ok is then false too, but it is a schedule, not a fault).
+        put(f"bee_counter_{n}_polled", c.get("polled"))
 
 
 _HIVEHEART_FLAT_FFT_RE = re.compile(r"^hiveheart_(\d+)_fft$")
@@ -1551,18 +1800,28 @@ def serialize_measurements(rows) -> list[dict]:
     return mask_inspection_readings(difference_bee_counter_intervals(measurements))
 
 
-def serialize_chart_measurements(cur) -> list[dict]:
-    """Map the slim CHART_MEASUREMENT_COLUMNS result set to API dicts.
+def fetch_chart_rows(cur) -> list[dict]:
+    """Read the slim CHART_MEASUREMENT_COLUMNS result set into dicts by column
+    name (rather than the positional mapping used for the full row).
 
-    Builds dicts by column name (rather than the positional mapping used for the
-    full row), seeds the compensated-weight defaults that measurement_row_to_dict
-    would normally set, then runs the same compensation / bee-counter / per-hive
-    transforms so the chart payload stays consistent with the full read APIs.
-    """
+    Kept apart from serialize_chart_measurements so the caller can release its
+    pooled connection first: the enrichment there checks out connections of its
+    own, and holding one while waiting for another lets a burst of chart
+    requests drain the pool and block each other until the pool timeout."""
     cols = [c.name for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def serialize_chart_measurements(rows: list[dict]) -> list[dict]:
+    """Turn fetch_chart_rows() output into API dicts.
+
+    Seeds the compensated-weight defaults that measurement_row_to_dict would
+    normally set, then runs the same compensation / bee-counter / per-hive
+    transforms so the chart payload stays consistent with the full read APIs.
+    Opens its own connections: call it with no pooled connection held.
+    """
     measurements: list[dict] = []
-    for r in cur.fetchall():
-        m = dict(zip(cols, r))
+    for m in rows:
         # Mirror measurement_row_to_dict: default compensated weights to the raw
         # weight so the keys always exist; attach_temperature_compensation()
         # overrides them when a coefficient is configured.
@@ -1577,6 +1836,97 @@ def serialize_chart_measurements(cur) -> list[dict]:
     measurements = attach_temperature_compensation(measurements)
     # Masked after differencing — see serialize_measurements for why.
     return mask_inspection_readings(difference_bee_counter_intervals(measurements))
+
+
+# Columns the daily weight extremes need: the weights, the temperatures the
+# compensation may read, and nothing that falls back to raw_json, so a year of
+# readings is read without de-TOASTing a single payload.
+DAILY_WEIGHT_COLUMNS = """
+    id, device_id, measured_at,
+    scale_1_weight_kg, scale_2_weight_kg,
+    hive_1_temp_c, hive_2_temp_c, ambient_temp_c
+"""
+DAILY_WEIGHT_CHUNK_ROWS = 5000
+# Rows of the previous chunk replayed ahead of the next one, so the temperature
+# EMA inside the compensation is warmed up rather than restarting at every
+# chunk boundary (alpha 0.3 settles well within this).
+DAILY_WEIGHT_EMA_WARMUP_ROWS = 40
+
+
+def daily_weight_extremes(
+    device_id: str, start_at: datetime, end_at: Optional[datetime], tz: tzinfo
+) -> list[dict]:
+    """Per hive and local calendar day: the highest and lowest weight reading.
+
+    Computed over EVERY reading in the range, not the down-sampled chart rows:
+    the chart keeps every k-th reading of a long range, and a maximum taken over
+    those is only the maximum of what happened to be kept. The weights go
+    through the same pipeline as the charts (per-hive readings for hives 3–18,
+    temperature compensation, inspection masking), so a day's maximum is the
+    compensated weight the chart would show, and a super lifted off during an
+    inspection is not a daily minimum.
+
+    Read in chunks of DAILY_WEIGHT_CHUNK_ROWS, each released back to the pool
+    before it is enriched (see fetch_chart_rows), so a five-year range neither
+    holds a connection nor builds every row in memory at once.
+    """
+    extremes: dict[tuple[int, str], dict] = {}
+    warmup: list[dict] = []
+    after: Optional[tuple] = None
+    while True:
+        where = ["device_id = %s", "measured_at >= %s"]
+        params: list[Any] = [device_id, start_at]
+        if end_at is not None:
+            where.append("measured_at <= %s")
+            params.append(end_at)
+        if after is not None:
+            where.append("(measured_at, id) > (%s, %s)")
+            params.extend(after)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {DAILY_WEIGHT_COLUMNS} FROM measurements "
+                    f"WHERE {' AND '.join(where)} ORDER BY measured_at, id LIMIT %s;",
+                    [*params, DAILY_WEIGHT_CHUNK_ROWS],
+                )
+                rows = fetch_chart_rows(cur)
+        if not rows:
+            break
+        replay = {r["id"] for r in warmup}
+        for m in serialize_chart_measurements(warmup + rows):
+            if m.get("id") in replay or m.get("measured_at") is None:
+                continue
+            day = m["measured_at"].astimezone(tz).date().isoformat()
+            for key, value in m.items():
+                hive = _compensated_weight_hive(key)
+                if hive is None or value is None:
+                    continue
+                cur_day = extremes.setdefault((hive, day), {
+                    "hive": hive, "date": day,
+                    "max_kg": value, "max_at": m["measured_at"],
+                    "min_kg": value, "min_at": m["measured_at"],
+                })
+                if value > cur_day["max_kg"]:
+                    cur_day["max_kg"], cur_day["max_at"] = value, m["measured_at"]
+                if value < cur_day["min_kg"]:
+                    cur_day["min_kg"], cur_day["min_at"] = value, m["measured_at"]
+        if len(rows) < DAILY_WEIGHT_CHUNK_ROWS:
+            break
+        warmup = rows[-DAILY_WEIGHT_EMA_WARMUP_ROWS:]
+        after = (rows[-1]["measured_at"], rows[-1]["id"])
+    return sorted(extremes.values(), key=lambda d: (d["hive"], d["date"]))
+
+
+_COMPENSATED_WEIGHT_KEY = re.compile(r"^scale_(\d+)_weight_kg_compensated$")
+
+
+def _compensated_weight_hive(key: str) -> Optional[int]:
+    """The hive index of a ``scale_{n}_weight_kg_compensated`` key, else None.
+
+    The compensated key is what the dashboard charts: it equals the raw weight
+    when no temperature coefficient is configured."""
+    match = _COMPENSATED_WEIGHT_KEY.match(key)
+    return int(match.group(1)) if match else None
 
 
 def execute_measurement_query(cur, columns, where_parts, params, limit, max_points):

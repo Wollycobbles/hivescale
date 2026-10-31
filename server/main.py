@@ -16,6 +16,7 @@ The domain logic lives in the sibling modules:
 - local_dashboard.py    self-host dashboard API (/api/v1/local/*)
 - publish.py            published charts: admin API + public embeds (/embed/*)
 """
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,10 +59,37 @@ limiter = Limiter(
     headers_enabled=True,
 )
 
+def startup():
+    db_pool.open()
+    FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    init_db()
+    start_notification_worker()
+    start_insight_reconciler()
+    mqtt_publisher.start()
+
+
+def shutdown():
+    stop_insight_reconciler()
+    stop_notification_worker()
+    mqtt_publisher.stop()
+    db_pool.close()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    startup()
+    try:
+        yield
+    finally:
+        shutdown()
+
+
 app = FastAPI(
     title="HiveHub API",
     description="HTTP endpoint for ESP32-based dual hive scales.",
     version=SERVER_VERSION,
+    lifespan=lifespan,
 )
 
 # Rate limiting (slowapi): keyed on the real client IP, emits standard RateLimit
@@ -89,25 +117,6 @@ if RATE_LIMIT_ENABLED:
 # broke the HiveInside relay outright ("invalid firmware content length -1").
 # See SelectiveGZipMiddleware.
 app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
-
-
-@app.on_event("startup")
-def startup():
-    db_pool.open()
-    FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
-    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    init_db()
-    start_notification_worker()
-    start_insight_reconciler()
-    mqtt_publisher.start()
-
-
-@app.on_event("shutdown")
-def shutdown():
-    stop_insight_reconciler()
-    stop_notification_worker()
-    mqtt_publisher.stop()
-    db_pool.close()
 
 
 @app.get("/health")
@@ -146,26 +155,17 @@ DASHBOARD_DIR = Path(__file__).resolve().parent / "dashboard"
 class DashboardStaticFiles(StaticFiles):
     """StaticFiles with explicit Cache-Control headers.
 
-    Starlette sends only ETag/Last-Modified, so every dashboard load
-    re-validates all ~9 assets with conditional requests. The HTML shell stays
-    no-cache (a deploy shows up on the next load); the JS/CSS assets get a
-    modest max-age so repeat loads within the hour skip the network entirely,
-    falling back to ETag re-validation once it expires.
+    Everything is no-cache: the browser keeps its copy but re-validates it
+    with the ETag on each load, so an unchanged file costs a 304 and a deploy
+    shows up on the next load. The asset URLs are not versioned, so a max-age
+    here kept serving the previous release's JS (e.g. a login page without the
+    SSO button) for up to an hour after an upgrade — longer behind a CDN.
     """
 
     async def get_response(self, path: str, scope):
         response = await super().get_response(path, scope)
         if response.status_code < 400:
-            # The HTML shell, the service worker and the manifest must revalidate
-            # every load so a deploy (or a changed SW) is picked up promptly; the
-            # hashed-in-practice JS/CSS assets get a modest max-age.
-            if (
-                path in ("", ".", "index.html", "sw.js", "manifest.webmanifest")
-                or path.endswith(".html")
-            ):
-                response.headers["Cache-Control"] = "no-cache"
-            else:
-                response.headers["Cache-Control"] = "public, max-age=3600"
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
 

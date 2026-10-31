@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Backend server version. Bump on releases; reported in the OpenAPI metadata
 # (/docs) and by GET /health so a deployment's version is visible remotely.
-SERVER_VERSION = "0.5.3"
+SERVER_VERSION = "0.7.1"
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 API_KEY = os.environ["API_KEY"]
@@ -41,6 +41,43 @@ DASHBOARD_COOKIE_SECURE = os.environ.get("DASHBOARD_COOKIE_SECURE", "false").str
     "yes",
     "on",
 )
+# Single sign-on for the local dashboard via OpenID Connect (written against
+# authentik, but any standards-compliant provider works). The backend runs the
+# Authorization Code flow with PKCE as a confidential client, validates the ID
+# token against the provider's JWKS, and then issues the normal dashboard
+# session cookie — no provider token ever reaches the browser. Users are mapped
+# to EXISTING dashboard accounts by e-mail address (case-insensitive); an
+# unknown address is refused, and the role always comes from the local account.
+# OIDC_ISSUER is the provider's issuer URL, for authentik
+# https://auth.example.com/application/o/<application-slug>/ — every endpoint is
+# discovered from its /.well-known/openid-configuration.
+OIDC_ENABLED = os.environ.get("OIDC_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "").strip()
+OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "").strip()
+OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "").strip()
+OIDC_SCOPES = os.environ.get("OIDC_SCOPES", "openid email profile").strip()
+# Label on the login button ("Sign in with <label>").
+OIDC_PROVIDER_NAME = os.environ.get("OIDC_PROVIDER_NAME", "authentik").strip() or "authentik"
+# Callback URL registered at the provider. Defaults to
+# PUBLIC_BASE_URL + /api/v1/local/auth/oidc/callback.
+OIDC_REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI", "").strip()
+# Where the provider sends the browser after RP-initiated logout. Defaults to
+# PUBLIC_BASE_URL + /dashboard/.
+OIDC_POST_LOGOUT_REDIRECT_URI = os.environ.get("OIDC_POST_LOGOUT_REDIRECT_URI", "").strip()
+# Refuse logins whose email_verified claim is not true. authentik reports
+# email_verified=false for users unless the "email" scope mapping says
+# otherwise — set this to false if you trust the addresses in your authentik.
+OIDC_REQUIRE_EMAIL_VERIFIED = os.environ.get(
+    "OIDC_REQUIRE_EMAIL_VERIFIED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# Only takes effect while OIDC is enabled and configured (so it can never lock
+# everybody out): hides the password form and refuses password logins.
+OIDC_DISABLE_PASSWORD_LOGIN = os.environ.get(
+    "OIDC_DISABLE_PASSWORD_LOGIN", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+OIDC_HTTP_TIMEOUT_SECONDS = int(os.environ.get("OIDC_HTTP_TIMEOUT_SECONDS", "10"))
 # Public data embeds ("Publish data", see server/publish.py). An admin can
 # publish a chart of selected hives from the dashboard; the server then serves
 # exactly that slice — and nothing else — without a login, under
@@ -95,6 +132,14 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(256 * 1024)))
 # Firmware uploads are large by design and are capped separately, while being
 # streamed to disk, inside the upload endpoint itself.
 MAX_FIRMWARE_BYTES = int(os.environ.get("MAX_FIRMWARE_BYTES", str(16 * 1024 * 1024)))
+# SD backup uploads are held in memory while they are parsed, so they are capped
+# too (mirrors the HivePal proxy's cap). Also bounds the HivePal JSON import body.
+SD_IMPORT_MAX_FILE_SIZE = int(
+    os.environ.get("HIVEHUB_SD_IMPORT_MAX_FILE_SIZE", str(250 * 1024 * 1024))
+)
+# Head-room for the multipart framing around an uploaded file, so the body-size
+# guard can cap an upload request at its file limit plus this.
+UPLOAD_ENVELOPE_BYTES = 1024 * 1024
 
 # ── Insights history / alert lifecycle reconciliation ────────────────────────
 # Sensor-based insights (server/insights.py) are recomputed on demand and never
@@ -116,6 +161,13 @@ INSIGHTS_RECONCILE_INTERVAL_SECONDS = int(
 INSIGHTS_HISTORY_LOOKBACK_DAYS = int(
     os.environ.get("INSIGHTS_HISTORY_LOOKBACK_DAYS", "14")
 )
+# Where the apiary is, for the rules' local-time windows (late-afternoon
+# robbing, daytime swarms, night-time vibration, calendar days) and seasons.
+# A device's own night-mode timezone wins when it is one of the dashboard's
+# presets; otherwise this IANA zone applies (default: the container's TZ, then
+# UTC). The season rules assume the northern hemisphere unless told otherwise.
+INSIGHTS_TIMEZONE = os.environ.get("INSIGHTS_TIMEZONE", "").strip() or os.environ.get("TZ", "").strip()
+INSIGHTS_HEMISPHERE = os.environ.get("INSIGHTS_HEMISPHERE", "north").strip().lower()
 
 
 def _env_bool(name: str, default: str = "false") -> bool:

@@ -170,18 +170,20 @@
 // ==============================
 // HiveHub historically served exactly two hives (two HX711 load cells, two
 // DS18B20 probes, two BLE slots). v0.20.0 generalises this to a dynamic registry
-// of up to MAX_HIVES hives, each carrying one scale source and at most one
-// non-scale in-hive sensor, configured from the provisioning portal and stored as a per-hive JSON blob in
-// NVS (see firmware/src/hive_config.cpp).
+// of up to MAX_HIVES hives, each carrying one scale source and up to three
+// in-hive sensors, one per lane (see ble_lanes.h), configured from the
+// provisioning portal and stored as a per-hive JSON blob in NVS (see
+// firmware/src/hive_config.cpp).
 //
 //   - Scales: HX711 (legacy pins) and/or NAU7802 I2C channels via the
 //     NAU7802 + TCA9548A path below. See the wired-channel topology note on
 //     MAX_SCALES — all-NAU7802 tops out at 16; 18 needs the 2 HX711 channels.
 //   - Wired temperature: up to MAX_HIVES DS18B20 on the single ONE_WIRE_PIN bus,
 //     addressed by ROM (not by index) so each probe maps to a specific hive.
-//   - In-hive sensors: one non-scale BLE/GATT sensor OR one DS18B20 per hive.
-//     BLE HiveScale selected as a scale source is stored separately from that
-//     in-hive sensor; serial GATT reads are still capped per cycle (see below).
+//   - In-hive sensors, one per lane: a beacon (HolyIot / RuuviTag /
+//     HiveInside) OR a wired DS18B20, plus a HiveTraffic counter, plus a
+//     HiveHeart. A BLE HiveScale selected as the scale source is its own lane.
+//     Serial GATT reads are capped per cycle and rotate across wakes (below).
 #ifndef MAX_HIVES
 #define MAX_HIVES 18
 #endif
@@ -397,8 +399,10 @@
 // (HiveHeart, GATT-mode HiveInside, wireless HiveScale, HiveTraffic) instead need
 // a SERIAL connect→read→disconnect of seconds each, so reading many of them would
 // keep the radio awake for minutes and defeat deep sleep. Cap the number of GATT
-// reads attempted per wake cycle; remaining paired GATT sensors are skipped this
-// cycle (and logged). Beacons are never capped.
+// reads attempted per wake cycle, separately for HiveTraffic counters and for
+// HiveHeart/HiveScale. When more are paired they take turns: each wake resumes
+// where the last one stopped (gatt_rotation.h), so none is starved. Beacons are
+// never capped.
 #ifndef MAX_GATT_READS_PER_CYCLE
 #define MAX_GATT_READS_PER_CYCLE 4
 #endif
@@ -547,12 +551,6 @@
 #define HIVEINSIDE_OTA_CHUNK_MAX 244
 #endif
 
-// True when the GATT-client scaffolding (address-type capture during the scan,
-// used to connect by the node's identity address) must be compiled in. The OTA
-// relay is now the only consumer — a beacon nRF54 HiveInside is never connected
-// to for measurements.
-#define HIVEINSIDE_GATT_CLIENT (HIVEINSIDE_OTA_ENABLED)
-
 // ==============================
 // HIVEINSIDE AUDIO (on-request microphone stream)
 // ==============================
@@ -567,6 +565,14 @@
 #ifndef HIVEINSIDE_AUDIO_ENABLED
 #define HIVEINSIDE_AUDIO_ENABLED ENABLE_BLE_SCAN
 #endif
+
+// True when the GATT-client scaffolding (address-type capture during the scan,
+// used to connect by the node's identity address) must be compiled in. Both
+// relays connect to the node — OTA and audio — so either one needs it; a beacon
+// nRF54 HiveInside is never connected to for measurements. Defined after both
+// flags so neither can be read before it is set, and an audio-only build
+// (HIVEINSIDE_OTA_ENABLED 0) keeps the address cache locateByScan() relies on.
+#define HIVEINSIDE_GATT_CLIENT (HIVEINSIDE_OTA_ENABLED || HIVEINSIDE_AUDIO_ENABLED)
 
 // PCM staging ring, in bytes, between the NimBLE host task and the TLS upload
 // loop. The node emits 32000 B/s and never waits for us, so this is really
@@ -885,9 +891,11 @@
 //            This pin used to be the setup button; the swap frees the one
 //            external, weatherproofable button for the thing a beekeeper
 //            actually presses at the hive stand.
-// Both are button-to-GND with INPUT_PULLUP. Only D2 wakes the hub from deep
-// sleep: C6 deep-sleep GPIO wakeup is an LP-IO feature and only GPIO0..GPIO7
-// have that pad, so GPIO9 can never be armed as a wake source (an earlier
+//   D0     — optional external setup button, AP only, off by default (see
+//            EXTERNAL_SETUP_BUTTON_PIN below). Wakes the hub like D2 does.
+// All are button-to-GND with INPUT_PULLUP. Only D2 (and D0, if enabled) can
+// wake the hub from deep sleep: C6 deep-sleep GPIO wakeup is an LP-IO feature
+// and only GPIO0..GPIO7 have that pad, so GPIO9 can never be armed as a wake source (an earlier
 // firmware passed it anyway, which made esp_deep_sleep_enable_gpio_wakeup()
 // reject the whole mask and silently disarmed D2 too — see
 // configureButtonWake()). GPIO9 is also the ESP32-C6 boot-mode strapping pin:
@@ -908,7 +916,40 @@
 // press toggles inspection mode (see inspection.h). Any normally-open switch
 // works: a plain pushbutton, or a keyed one if the apiary is public.
 #define INSPECTION_BUTTON_PIN 2   // D2
+
+// Optional external setup button on D0 — momentary, button-to-GND,
+// INPUT_PULLUP. Off by default; enable per device in secrets.h with
+//   #define ENABLE_EXTERNAL_SETUP_BUTTON 1
+// A press opens the provisioning AP, exactly like a press on the on-board USER
+// button, but with two differences that make it the better choice for a
+// button brought out to the enclosure wall:
+//   * GPIO0 has an LP-IO pad, so unlike GPIO9 it CAN wake the hub from deep
+//     sleep — a press opens the AP straight away, no waiting for a wake;
+//   * GPIO0 is not an ESP32-C6 strapping pin (those are GPIO4/5/8/9/15), so a
+//     press held across a power-up or RESET boots normally instead of landing
+//     in the serial bootloader. (GPIO0 IS a strapping pin on the classic
+//     ESP32 — that warning in the 30-pin section above does not apply here.)
+// It deliberately has NO long-press factory reset: a stuck or wet button on
+// the outside of a box must not be able to wipe the hub. Factory reset stays
+// on the on-board USER button. The AP it opens has no password, so mount it
+// where a passer-by cannot reach it, and add an external ~10 kΩ pull-up to
+// 3.3 V on a long lead (the internal pull-up is weak).
+#ifndef ENABLE_EXTERNAL_SETUP_BUTTON
+#define ENABLE_EXTERNAL_SETUP_BUTTON 0
+#endif
+#if ENABLE_EXTERNAL_SETUP_BUTTON
+#define EXTERNAL_SETUP_BUTTON_PIN 0   // D0
+#endif
 #endif // HIVEHUB_BOARD_XIAO_C6 || CONFIG_IDF_TARGET_ESP32C6
+
+// Only the C6 build defines EXTERNAL_SETUP_BUTTON_PIN; on the 30-pin board
+// ENABLE_EXTERNAL_SETUP_BUTTON is ignored (its setup button is already
+// external, on GPIO27).
+#if defined(EXTERNAL_SETUP_BUTTON_PIN)
+#define HAS_EXTERNAL_SETUP_BUTTON 1
+#else
+#define HAS_EXTERNAL_SETUP_BUTTON 0
+#endif
 
 // ==============================
 // INSPECTION MODE

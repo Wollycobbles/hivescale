@@ -1,7 +1,7 @@
 """Pydantic request/response models shared across the API routers."""
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -60,6 +60,13 @@ class HiveBleIn(BaseModel):
     battery_percent: Optional[int] = None
     battery_mv: Optional[int] = None
     rssi_dbm: Optional[int] = None
+    # RuuviTag diagnostics: the data format the tag sends (3 = RAWv1,
+    # 5 = RAWv2) and, for RAWv2, transmit power, movement counter and the
+    # measurement sequence. Kept in hive_readings.raw_json.
+    data_format: Optional[int] = None
+    tx_power_dbm: Optional[int] = None
+    movement_count: Optional[int] = None
+    sequence: Optional[int] = None
     firmware_version: Optional[str] = None
     # Board/architecture a HiveInside node advertises in its beacon identity
     # record (currently only "nrf54lm20a"), forwarded by the HiveHub.
@@ -109,7 +116,7 @@ class HiveBeeCounterIn(BaseModel):
     interval_out: Optional[int] = None
     # The diagnostic fields the counter also reports — protocol_version,
     # status_flags, uptime_s, num_gates, mcps_healthy, glitch_count, idle_s,
-    # banks — are deliberately NOT declared. extra="allow" carries them through
+    # banks, maint_s, polled — are deliberately NOT declared. extra="allow" carries them through
     # into hive_readings.raw_json, which is where they belong: nothing charts or
     # alerts on them, so a column each would be dead weight.
     #
@@ -133,6 +140,18 @@ class HiveBeeCounterIn(BaseModel):
     # reading, including the 7 of a counter nobody has narrowed, because a field
     # that appeared only when interesting would make "all banks on" and "counter
     # too old to say" the same absence.
+    #
+    # maint_s (wire revision 6) is the counter's lifetime seconds in USB
+    # maintenance sessions, during which its totals are frozen. The read APIs
+    # difference it into interval_maint_s so an interval that was a bench test
+    # is not read as a quiet hive (see counter_intervals.py). The hub sends it
+    # only for v6+ counters: its absence means "cannot say", not "none".
+    #
+    # polled is the hub's, not the counter's: false when the hub's GATT read
+    # rotation did not dial this counter this cycle (more counters paired than
+    # the per-wake budget). ok is false then too, but it is a schedule, not an
+    # unreachable counter. Hubs older than the flag never send it, and their
+    # ok:false keeps its old meaning.
 
 
 class HiveHeartIn(BaseModel):
@@ -223,6 +242,9 @@ class MeasurementIn(BaseModel):
     hive_2_humidity_percent: Optional[float] = None
     ambient_temp_c: Optional[float] = None
     ambient_humidity_percent: Optional[float] = None
+    # Barometric pressure from a pressure-capable ambient sensor on the hub
+    # (BME280, ENABLE_BME280_AMBIENT); null when none is fitted or the read failed.
+    ambient_pressure_hpa: Optional[float] = None
     battery_voltage: Optional[float] = None
     battery_voltage_v: Optional[float] = None
     battery_soc_percent: Optional[float] = None
@@ -255,6 +277,10 @@ class MeasurementIn(BaseModel):
     sd_ok: Optional[bool] = None
     rtc_ok: Optional[bool] = None
     sht_ok: Optional[bool] = None
+    # Boot-time detection of the ambient sensor, as opposed to sht_ok (did THIS
+    # cycle's read succeed). Together they tell "not fitted" from "fitted but
+    # failing".
+    sht_detected: Optional[bool] = None
     scale_1_raw: Optional[int] = None
     scale_2_raw: Optional[int] = None
     # ── INMP441 stereo microphone telemetry ──────────────────────────────────
@@ -472,6 +498,18 @@ class MeasurementIn(BaseModel):
             return None
         return v
 
+    # The firmware always sends UTC with a "Z". A timestamp without any offset
+    # (a third-party client, a hand-edited SD line) is read as UTC too, rather
+    # than left naive: a naive value cannot be compared with the server clock,
+    # and resolve_measured_at() then failed with a TypeError (HTTP 500, or a
+    # whole import aborted) instead of storing the reading.
+    @field_validator("timestamp")
+    @classmethod
+    def _naive_timestamp_is_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
 
 # Max measurements accepted in a single bulk-import request. The HivePal backend
 # chunks a large SD download into batches no larger than this before forwarding.
@@ -642,10 +680,12 @@ class FirmwareReleaseIn(BaseModel):
     version: str
     filename: str
     active: bool = True
-    # "beecounter" is no longer an accepted target: BeeCounter firmware was
-    # delivered over the (removed) wired I2C relay, and no BLE/GATT OTA exists
-    # yet — a registered beecounter image could never reach a device.
-    target: Literal["hivescale", "hiveinside"] = "hivescale"
+    # The same three targets as firmware.FIRMWARE_TARGETS and the multipart
+    # upload: "beecounter" is the HiveTraffic counter, whose image the hub
+    # relays over BLE GATT (update_beecounter). This endpoint used to accept
+    # only the first two, so the documented JSON registration of a counter
+    # image failed request validation while the upload path took it.
+    target: Literal["hivescale", "hiveinside", "beecounter"] = "hivescale"
 
     @field_validator("target", mode="before")
     @classmethod
@@ -658,8 +698,8 @@ class FirmwareReleaseIn(BaseModel):
     # Board/architecture this image was built for. Required in effect for the
     # "hivescale" target ("esp32" / "esp32-c6") so OTA never serves a 30-pin
     # ESP32 (Xtensa) image to an ESP32-C6 (RISC-V) or vice versa; for
-    # "hiveinside" the only valid board is "nrf54lm20a". When omitted for a
-    # hivescale release it is derived from the board-stamped filename.
+    # "hiveinside" the only valid board is "nrf54lm20a", for "beecounter"
+    # "esp32-c6". When omitted it is derived from the board-stamped filename.
     board: Optional[str] = None
 
 
@@ -691,8 +731,9 @@ class DeviceCommandIn(BaseModel):
         "start_inspection",
         "stop_inspection",
         # On-request hive audio (issue #71). Payload carries slot, recording_id,
-        # duration_ds (0 = live/open-ended) and gain_db; the hub derives the
-        # upload URL from its own device id rather than trusting the payload.
+        # duration_ds (0 = live/open-ended) and gain_db (-20..+40 dB, or 127 =
+        # automatic: HiveInside 0.8.0+ picks one gain per clip); the hub derives
+        # the upload URL from its own device id rather than trusting the payload.
         "record_audio",
     ]
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -798,6 +839,9 @@ class RecordingFinalizeIn(BaseModel):
     ring_overruns: int = Field(default=0, ge=0)
     ring_dropped_bytes: int = Field(default=0, ge=0)
     clipped_pct: int = Field(default=0, ge=0, le=100)
+    # HiveInside 0.8.0+ / hub 0.33.0+: the gain the node applied, from the DATA
+    # header. Omitted by older hubs, and by any hub talking to an older node.
+    applied_gain_db: Optional[int] = Field(default=None, ge=-20, le=40)
     elapsed_ms: int = Field(default=0, ge=0)
     sample_rate: Optional[int] = Field(default=None, ge=1, le=192000)
     device_error: Optional[int] = Field(default=None, ge=0, le=255)
@@ -881,6 +925,9 @@ class DeviceChannelsUpdateIn(BaseModel):
     # reports, not just the first two. Ignored entries outside 1..MAX_HIVES are
     # dropped by apply_device_channels().
     names: Optional[dict[str, Optional[str]]] = None
+    # HivePal hive id linked to each hive index ("1".."18" -> id). An empty
+    # string clears the link; indexes left out are not touched.
+    hive_ids: Optional[dict[str, Optional[str]]] = None
 
 
 # Lightweight email check — good enough to catch typos without pulling in the
@@ -901,9 +948,12 @@ def normalize_optional_email(value: Optional[str]) -> Optional[str]:
 
 
 class DashboardSetupIn(BaseModel):
-    """First-run wizard payload: creates the initial admin account."""
+    """First-run wizard payload: creates the initial admin account.
+
+    The password may only be omitted when password login is disabled in favour
+    of SSO; the e-mail is then required (it is the SSO identity)."""
     username: str = Field(..., min_length=3, max_length=64)
-    password: str = Field(..., min_length=8, max_length=256)
+    password: Optional[str] = Field(default=None, min_length=8, max_length=256)
     email: Optional[str] = Field(default=None, max_length=254)
 
     _norm_email = field_validator("email")(lambda cls, v: normalize_optional_email(v))
@@ -915,8 +965,10 @@ class DashboardLoginIn(BaseModel):
 
 
 class DashboardCreateUserIn(BaseModel):
+    """Omitting the password creates an SSO-only account (allowed only while SSO
+    is enabled, and then the e-mail is required)."""
     username: str = Field(..., min_length=3, max_length=64)
-    password: str = Field(..., min_length=8, max_length=256)
+    password: Optional[str] = Field(default=None, min_length=8, max_length=256)
     role: Literal["admin", "viewer"] = "viewer"
     email: Optional[str] = Field(default=None, max_length=254)
 

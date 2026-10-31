@@ -111,7 +111,7 @@ without this field remain supported but cannot get this delivery guarantee.
 
 **Auth:** `X-API-Key` (per-device key — registered on first contact, enforced thereafter)
 
-> **Multi-hive payload (firmware v0.20.0+).** Devices now report up to 16 hives in
+> **Multi-hive payload (firmware v0.20.0+).** Devices now report up to 18 hives in
 > a `hives` array (see below); the flat `scale_1/2_*` / `hive_1/2_*` fields are the
 > legacy two-hive form and remain accepted. The server stores per-hive data in the
 > `hive_readings` table, mirrors hives 1–2 onto the legacy columns, and on read
@@ -154,7 +154,7 @@ without this field remain supported but cannot get this delivery guarantee.
 | `hive_2_humidity_percent` | number | No | Hive 2 internal relative humidity (from a paired in-hive BLE sensor) |
 | `ambient_temp_c` | number | No | Ambient temperature (SHT4x by default; SHT3x or BME280 if configured) |
 | `ambient_humidity_percent` | number | No | Ambient relative humidity (SHT4x/SHT3x/BME280) |
-| `ambient_pressure_hpa` | number | No | Ambient barometric pressure. Only sent when a pressure-capable ambient sensor (BME280) is compiled in; currently not persisted to a dedicated column, so the ingest schema ignores it |
+| `ambient_pressure_hpa` | number | No | Ambient barometric pressure from the hub's own sensor. Only sent when a pressure-capable ambient sensor (BME280) is compiled in; stored and shown as the dashboard's apiary pressure (server 0.6.2+; older servers dropped it) |
 | `battery_voltage` | number | No | Legacy battery/supply voltage field |
 | `battery_voltage_v` | number | No | Battery voltage from MAX17048; preferred off-grid field |
 | `battery_soc_percent` | number | No | LiPo state-of-charge percentage |
@@ -178,7 +178,7 @@ without this field remain supported but cannot get this delivery guarantee.
 | `sd_ok` | boolean | No | SD card status |
 | `rtc_ok` | boolean | No | RTC status |
 | `sht_ok` | boolean | No | Whether the current cycle produced a valid ambient measurement (SHT4x/SHT3x/BME280; false when `ambient_temp_c`/`ambient_humidity_percent` are null because the read failed). Field name kept `sht_*` for backward compatibility |
-| `sht_detected` | boolean | No | Whether the ambient sensor was detected/initialized at boot (diagnostic; ignored by the backend, retained in the raw upload) |
+| `sht_detected` | boolean | No | Whether the ambient sensor was detected/initialized at boot (diagnostic, next to the per-cycle `sht_ok`; stored since server 0.6.2, dropped entirely before) |
 | `scale_1_raw` | integer | No | Raw HX711 reading for scale 1 |
 | `scale_2_raw` | integer | No | Raw HX711 reading for scale 2 |
 
@@ -238,7 +238,13 @@ as constant after boot.
 
 `bee_counter_N_interval_in` / `_interval_out` are also accepted and are fully
 live — the BLE path leaves them null on ingest and the read APIs backfill them
-by differencing consecutive totals.
+by differencing consecutive totals. The derived value is written to both shapes
+of a read response, the flat `bee_counter_N_interval_*` alias and the nested
+`hives[].bee_counter.interval_*`, so they always agree. Alongside, `bee_counter_N_interval_maint_s` /
+`hives[].bee_counter.interval_maint_s` give the seconds of that interval the
+counter spent in a USB maintenance session (totals frozen; `0` = none, absent =
+cannot say — the counter predates wire revision 6). See
+[hivetraffic-bee-counter.md](hivetraffic-bee-counter.md#maintenance-sessions).
 
 The wired-only telemetry — `_busy_retries`, `_read_attempts`,
 `_latch_succeeded`, and the per-gate 24-byte arrays
@@ -580,7 +586,10 @@ Registers or updates a firmware release. The binary must already exist in `FIRMW
 ```
 
 `target` defaults to `hivescale` and may also be `hiveinside` or `beecounter`
-(the HiveTraffic counter). Response:
+(the HiveTraffic counter). An optional `board` is checked against the target and
+the board-stamped filename: `esp32`/`esp32-c6` for `hivescale` (required, or
+derivable from the filename), `nrf54lm20a` for `hiveinside`, `esp32-c6` for
+`beecounter`. A mismatch is refused with `400`. Response:
 
 ```json
 { "status": "ok", "version": "0.9.3", "target": "hivescale", "crc32": 2882343476 }
@@ -722,7 +731,7 @@ permanent "relaying…". The attempt counter lives in `device_commands.attempts`
 | `check_ota` / `ota_update` | `{}` | Trigger immediate OTA check/update |
 | `update_hiveinside` | `{"slot": 1, "url": "...", "version": "...", "crc32": 123}` | Relay a firmware image to a HiveInside sensor over BLE GATT (normally queued via the `update-hiveinside` helper above) |
 | `update_beecounter` | `{"slot": 1, "url": "...", "version": "...", "crc32": 123}` | Relay a firmware image to a HiveTraffic counter over BLE GATT (normally queued via the `update-beecounter` helper above) |
-| `record_audio` | `{"slot": 1, "recording_id": 42, "duration_ds": 0, "gain_db": 0}` | Record audio from the HiveInside node on hive `slot` and stream it to the backend (normally queued via the `record-audio` helper, which creates the recording row first). `duration_ds` is deciseconds; **0 means live** — the node ends the session at its own 60-second cap. No URL is carried: the hub derives the upload target from its own device id, so microphone audio can never be posted to an address a queued command chose. Firmware 0.30.0+, HiveInside 0.6.0+ — see [Listening to a hive](audio-recording.md) |
+| `record_audio` | `{"slot": 1, "recording_id": 42, "duration_ds": 0, "gain_db": 127}` | Record audio from the HiveInside node on hive `slot` and stream it to the backend. `gain_db` is −20…+40 dB, or `127` for automatic gain (HiveInside 0.8.0+; older nodes apply +20 dB) (normally queued via the `record-audio` helper, which creates the recording row first). `duration_ds` is deciseconds; **0 means live** — the node ends the session at its own 60-second cap. No URL is carried: the hub derives the upload target from its own device id, so microphone audio can never be posted to an address a queued command chose. Firmware 0.30.0+, HiveInside 0.6.0+ — see [Listening to a hive](audio-recording.md) |
 | `start_provisioning` | `{}` | Start the provisioning AP — the remote equivalent of a press on the setup button. The device opens it at the end of the cycle that picked the command up, and closes it again on the portal timeout. From firmware 0.25.5 it **reboots first** when the portal's BLE pairing scan would otherwise be unable to run (the usual case once a sensor is paired), so the AP appears a few seconds later and after one extra boot; the command result is posted before the reboot. Also queued by the dashboard's **Device & admin → Configuration → Start AP mode** button (`POST /api/v1/local/devices/{device_id}/provisioning/start`, admin) |
 
 Response:
@@ -830,16 +839,33 @@ Readings, config and channel names are untouched; only the pairing is undone.
 
 ### `GET /api/v1/app/devices/{device_id}/channels`
 
-Returns channel display names for scale 1 and scale 2.
-
-### `PATCH /api/v1/app/devices/{device_id}/channels`
-
-Updates channel display names. Requires `owner` or `admin`.
+Returns the hive display names and HivePal hive links for every hive index.
+`scale_1/2_display_name` are the legacy two-hive fields; `names` and `hive_ids`
+are keyed by hive index (`"1"`–`"18"`).
 
 ```json
 {
   "scale_1_display_name": "Buckfast colony",
-  "scale_2_display_name": "Carnica colony"
+  "scale_2_display_name": "Carnica colony",
+  "names": { "1": "Buckfast colony", "2": "Carnica colony", "5": "Nuc 3" },
+  "hive_ids": { "1": "3c1f…", "5": "a07e…" }
+}
+```
+
+`GET /api/v1/app/devices` carries the same `names` and `hive_ids` maps inside
+each device's `channels` object.
+
+### `PATCH /api/v1/app/devices/{device_id}/channels`
+
+Updates hive display names and/or links. Requires `owner` or `admin`. Only the
+indexes you send are touched. A name of `null` leaves it alone and `""` clears it.
+A `hive_ids` entry of `""` or `null` removes the link. HiveHub never resolves
+`hive_ids`; it stores the HivePal hive id so the mapping survives a rename.
+
+```json
+{
+  "names": { "1": "Buckfast colony", "3": "Nuc 3" },
+  "hive_ids": { "1": "3c1f…", "3": "" }
 }
 ```
 
@@ -932,8 +958,11 @@ forced onto every row):
 }
 ```
 
-Import is idempotent: `(device_id, measured_at)` is the natural key, so rows that
-already exist — and rows repeated within the file — are skipped, not duplicated.
+Import is idempotent: each row's `measurement_id` is its natural key — the same
+one live ingest de-duplicates on — with `(device_id, measured_at)` as the
+fallback for rows that carry none. Rows that already exist, and rows repeated
+within the file, are skipped, not duplicated. A `timestamp` without a UTC offset
+is read as UTC.
 
 #### Response
 
@@ -1145,9 +1174,22 @@ owner has not approved it yet, so the device will **not** auto-flash until they 
   "latest_is_official": false,
   "approved_version": null,
   "update_available": true,
-  "pending_approval": true
+  "pending_approval": true,
+  "device_board": "esp32",
+  "other_board_releases": [],
+  "hiveinside_latest_version": "1.4.0",
+  "hiveinside_relays": {
+    "3": { "status": "running", "message": null, "version": "1.4.0",
+           "created_at": "2026-09-01T10:00:00+00:00", "completed_at": null }
+  },
+  "beecounter_latest_version": "0.7.1",
+  "beecounter_relays": {}
 }
 ```
+
+`hiveinside_relays` / `beecounter_relays` hold the last relay attempt per hive
+slot (the same data the local dashboard's firmware card shows), so a queued,
+running or failed node update is visible to HivePal too.
 
 ### `POST /api/v1/app/devices/{device_id}/firmware/approve`
 
@@ -1279,6 +1321,42 @@ recurrence of the same detector starts a new row.
 }
 ```
 
+### `POST /api/v1/app/devices/{device_id}/provisioning/start`
+
+Opens the hub's setup access point remotely. It queues a `start_provisioning`
+command, and the hub opens its AP after its next check-in, so up to one send
+interval later. Requires `owner` or `admin`.
+
+```json
+{ "status": "pending", "id": 91, "command_type": "start_provisioning", "payload": {} }
+```
+
+### `GET /api/v1/app/devices/{device_id}/export/measurements/summary?start_at=&end_at=`
+
+Returns how many readings an export of this device and period would contain:
+`{devices:[{device_id, measurements, first_measured_at, last_measured_at}],
+total_measurements, filename}`. Requires `owner` or `admin`.
+
+### `GET /api/v1/app/devices/{device_id}/export/measurements?hive=&start_at=&end_at=`
+
+Streams this device's readings as an SD-style NDJSON backup, the same format as
+the local dashboard download. `hive` may be repeated to limit the per-hive fields
+written. The file imports straight back through the SD upload. Requires `owner`
+or `admin`.
+
+### `POST /api/v1/app/devices/{device_id}/measurements/delete`
+
+Deletes this device's readings in `[start_at, end_at]`. It is gated by the
+device's claim code as a second factor, exactly like the local dashboard.
+Owner only.
+
+```json
+{ "start_at": "2026-09-01T00:00:00Z", "end_at": "2026-09-01T00:10:00Z", "claim_code": "ABCD-1234" }
+```
+
+Response: `{ "status": "ok", "device_id": "...", "deleted": 3 }`. A wrong claim
+code returns `403`.
+
 ---
 
 ## Hive audio recordings
@@ -1306,9 +1384,9 @@ to upload.
 
 | Query | Default | Meaning |
 |---|---|---|
-| `slot` | `1` | hive index, 1–16 — must be a hive with a HiveInside |
+| `slot` | `1` | hive index, 1–18 — must be a hive with a HiveInside |
 | `duration` | `0.0` | seconds, 0–60. `0` is open-ended; the node still stops at its own 60-second cap |
-| `gain_db` | `0` | −20…+20, applied on the node before transmission |
+| `gain_db` | omitted = automatic | Omit it (or send `127`) and a HiveInside 0.8.0+ node picks one gain for the whole clip from its first half second (RMS to −20 dBFS, peak below −3 dBFS, 0…+40 dB). Otherwise a fixed −20…+40 dB, applied on the node before transmission. Nodes older than HiveInside 0.8.0 cap at +20 dB and treat automatic as +20 dB. Before server 0.7.0 the default was a fixed 0 dB |
 
 Returns the new recording at status `requested`. **It is not instant**: the hub
 collects commands on its next wake, so expect one reporting interval. Requesting
@@ -1328,7 +1406,8 @@ One recording:
   "id": 42, "device_id": "hive_scale_dual_01", "hive_index": 1,
   "status": "ready", "requested_at": "2026-09-08T14:03:00+00:00",
   "started_at": "...", "completed_at": "...",
-  "requested_duration_s": 30.0, "gain_db": 0, "sample_rate": 16000,
+  "requested_duration_s": 30.0, "gain_db": 127, "gain_mode": "auto",
+  "applied_gain_db": 33, "sample_rate": 16000,
   "bytes": 960000, "seconds": 30.0,
   "dropped_bytes": 0, "gaps": 0, "clipped_pct": 1,
   "complete": true, "crc_ok": true, "confirmation": "verified",
@@ -1341,10 +1420,16 @@ One recording:
 | `status` | `requested` → `streaming` → `ready` / `failed`. A stale sweep resolves rows the hub stopped reporting on, so nothing sits in flight forever |
 | `seconds` | derived from `bytes` — what actually arrived, not what was asked for |
 | `dropped_bytes` / `gaps` / `ring_overruns` | audio the node's ring lost, sequence holes on the air, and notifications the hub's own staging ring refused because the upload was behind. Any one of them means the clip is spliced, and they have three different remedies. Split from a single summed `gaps` in firmware 0.30.2 / server 0.5.2; older hubs report the sum under `gaps` |
-| `clipped_pct` | samples that hit the rail; ≥5 % means lower the gain |
-| `crc_ok` | the hub's CRC matched the server's over the bytes on disk |
+| `gain_db` | the gain that was **requested**: −20…+40 dB, or `127` for automatic |
+| `gain_mode` | `"auto"` when `gain_db` is `127`, otherwise `"manual"` — so a client never has to know the sentinel |
+| `applied_gain_db` | the gain the node reports it **applied** (from its DATA header), −20…+40 dB. `null` when unknown: node older than HiveInside 0.8.0, hub older than firmware 0.33.0, or no audio arrived. Divide samples by `10^(applied_gain_db/20)` to compare clips made at different gains |
+| `clipped_pct` | samples that hit the rail; ≥5 % means lower the gain (or, with automatic gain, that something louder than the first half second came along) |
+| `crc_ok` | the node's and hub's CRCs agree **and** the hub's CRC matches the one the server computed over the bytes on disk (server 0.7.1+) |
+| `upload_intact` | `true`: the bytes on disk are exactly what the hub uploaded (CRC and, when the hub reports it, length). `false`: they are not — the upload was cut short, capped at `MAX_RECORDING_BYTES`, or altered. `null`: nothing to compare (no hub CRC, or a recording stored before server 0.7.1) |
+| `truncated` | the server stopped writing at `MAX_RECORDING_BYTES` |
+| `hub_bytes` | how many bytes the hub says it uploaded; `null` when it did not report it |
 | `confirmation` | `verified` / `reported` / `confirmed` / `unknown` — how much of the hub's account of the session actually arrived. See [How sure we are](audio-recording.md#how-sure-we-are-confirmation) |
-| `complete` | ready, corroborated, no gaps, no dropped bytes, no CRC disagreement |
+| `complete` | ready, corroborated, no gaps, no dropped bytes, no CRC disagreement, and nothing the server can see lost in the upload (`upload_intact` not `false`) |
 | `hub_message` | the hub's own words about the session, verbatim — usually more specific than anything the server can infer |
 
 ### `GET /api/v1/recordings/{recording_id}/audio.wav`
@@ -1400,7 +1485,7 @@ The backend auto-creates and updates the schema on startup.
 | `inspections` | Open and closed inspection windows per device/hive, with the note and end reason |
 | `hive_recordings` | One row per audio session: status, timings, byte count, CRC, quality counters and the `command_id` that carried it. The audio itself is a file under `RECORDINGS_DIR`, not a column |
 
-The backend creates the full schema on startup and runs idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements, so existing deployments upgrade automatically. Columns cover power telemetry (battery/solar), calibration mode, boot count, time source, INMP441 acoustic levels + FFT bands, per-hive HiveTraffic bee-counter counts (BLE/GATT), load-cell temperature-compensation config, per-hive vibration bands, in-hive BLE humidity/pressure, the beehivemonitoring.com `hiveheart_*` / `hivescale_*` fields, the normalized per-hive `hive_readings` table (multi-hive payloads), and the dashboard-auth tables (`dashboard_users`, `dashboard_settings`, `push_subscriptions`); `firmware_releases` gains `target`, `crc32`, `owner_user_id`, and `board`; `device_commands` gains `attempts`. The SQL files in `server/migrations/` (`001_offgrid_telemetry.sql` through `030_recording_ring_overruns.sql`) can also be applied manually. All fields remain available in `raw_json` for forward compatibility.
+The backend creates the full schema on startup and runs idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements, so existing deployments upgrade automatically. Columns cover power telemetry (battery/solar), calibration mode, boot count, time source, INMP441 acoustic levels + FFT bands, per-hive HiveTraffic bee-counter counts (BLE/GATT), load-cell temperature-compensation config, per-hive vibration bands, in-hive BLE humidity/pressure, the beehivemonitoring.com `hiveheart_*` / `hivescale_*` fields, the normalized per-hive `hive_readings` table (multi-hive payloads), and the dashboard-auth tables (`dashboard_users`, `dashboard_settings`, `push_subscriptions`); `firmware_releases` gains `target`, `crc32`, `owner_user_id`, and `board`; `device_commands` gains `attempts`. The SQL files in `server/migrations/` (`001_offgrid_telemetry.sql` through `035_recording_applied_gain.sql`) can also be applied manually. All fields remain available in `raw_json` for forward compatibility.
 
 ---
 

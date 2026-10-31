@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import sys
+import zlib
 from datetime import datetime, timezone
 
 SERVER_DIR = os.path.join(os.path.dirname(__file__), "..", "server")
@@ -35,12 +36,14 @@ os.environ.setdefault("RECORDINGS_DIR", "/tmp/hivehub-test-recordings")
 
 import recordings  # noqa: E402
 from recordings import (  # noqa: E402
+    GAIN_AUTO,
     SAMPLE_RATE,
     _path_for,
     _row_to_dict,
+    normalise_gain,
     wav_header,
 )
-from schemas import DeviceCommandIn  # noqa: E402
+from schemas import DeviceCommandIn, RecordingFinalizeIn  # noqa: E402
 
 NOW = datetime(2026, 9, 8, 14, 3, tzinfo=timezone.utc)
 
@@ -63,7 +66,8 @@ def row(**over):
         duration_ds=0, gain_db=0, sample_rate=SAMPLE_RATE,
         num_bytes=32000, crc32=123456, device_bytes=32000, device_crc32=123456,
         dropped_bytes=0, gaps=0, ring_overruns=0, ring_dropped_bytes=0,
-        clipped_pct=0, error=None, requested_by="max",
+        clipped_pct=0, applied_gain_db=None, error=None, requested_by="max",
+        server_crc32=123456, hub_bytes=32000, truncated=False,
         command_status="done", command_message=None,
     )
     base.update(over)
@@ -197,11 +201,88 @@ check("an open-ended request reports zero requested duration",
 check("a fixed request reports its duration in seconds",
       _row_to_dict(row(duration_ds=105))["requested_duration_s"] == 10.5)
 
+# ── what the server actually stored (review finding F2) ──────────────────────
+#
+# The hub's and node's checksums agreeing says nothing about the file on disk:
+# a proxy that cuts the upload short, or the server's own size cap, leaves them
+# in perfect agreement about audio the server never received. The review's
+# counterexample — 16 000 bytes stored, 32 000 reported, matching hub/node CRCs,
+# zero loss counters — was called verified and complete. It must not be.
+
+short = _row_to_dict(row(num_bytes=16000, server_crc32=654321))
+check("a body cut short is not complete", short["complete"] is False)
+check("...is not crc_ok", short["crc_ok"] is False)
+check("...is not verified", short["confirmation"] == "reported")
+check("...and says the upload is not intact", short["upload_intact"] is False)
+
+check("a length mismatch alone is enough to fail complete",
+      _row_to_dict(row(num_bytes=16000))["complete"] is False)
+check("a stored-CRC mismatch alone is enough to fail complete",
+      _row_to_dict(row(server_crc32=1))["complete"] is False)
+altered = _row_to_dict(row(server_crc32=1))
+check("an altered byte is not verified",
+      altered["confirmation"] == "reported" and altered["upload_intact"] is False)
+capped = _row_to_dict(row(truncated=True, device_bytes=None, device_crc32=None,
+                          crc32=None, hub_bytes=None))
+check("a recording cut at the server cap is never complete, even hub-confirmed",
+      capped["confirmation"] == "confirmed" and capped["complete"] is False
+      and capped["truncated"] is True)
+check("a clean recording says its upload is intact", d["upload_intact"] is True)
+
+# Recordings stored before the server computed its own CRC are not damaged, but
+# nothing ever checked them either: honest "unverified", still complete.
+legacy = _row_to_dict(row(server_crc32=None, hub_bytes=None))
+check("a pre-036 recording is unverified rather than verified",
+      legacy["confirmation"] == "reported" and legacy["crc_ok"] is False)
+check("...but not called incomplete", legacy["complete"] is True)
+check("...and its upload is simply unknown", legacy["upload_intact"] is None)
+
 # Bytes are what landed, and a partial recording must still report honestly.
 partial = _row_to_dict(row(num_bytes=16000, device_bytes=32000, gaps=2))
 check("seconds reflect what arrived, not what was expected", partial["seconds"] == 0.5)
 check("a partial recording is not complete", partial["complete"] is False)
 
+
+# ── gain: automatic by default (HiveInside#78) ──────────────────────────────
+#
+# "Auto" travels as gain_db = 127 from the API to the START byte, because every
+# hub already passes that byte through untouched. So the sentinel must survive
+# the clamp — clamping it to +40 would silently turn every auto request into a
+# loud fixed gain — and an omitted gain must mean auto, not 0 dB, which is the
+# nearly-inaudible recording the issue was about.
+
+check("an omitted gain means automatic", normalise_gain(None) == GAIN_AUTO == 127)
+check("the auto sentinel passes through the clamp", normalise_gain(127) == 127)
+check("0 dB stays a fixed 0 dB", normalise_gain(0) == 0)
+check("+40 dB is the top of the fixed range", normalise_gain(40) == 40)
+check("a fixed gain above +40 dB is clamped to +40", normalise_gain(60) == 40)
+check("a fixed gain below -20 dB is clamped to -20", normalise_gain(-60) == -20)
+
+auto_rec = _row_to_dict(row(gain_db=127, applied_gain_db=33))
+check("an auto request reads as gain_mode auto", auto_rec["gain_mode"] == "auto")
+check("the applied gain is reported next to the request",
+      auto_rec["applied_gain_db"] == 33 and auto_rec["gain_db"] == 127)
+manual_rec = _row_to_dict(row(gain_db=10, applied_gain_db=None))
+check("a fixed request reads as gain_mode manual", manual_rec["gain_mode"] == "manual")
+check("an unknown applied gain stays None, not a false 0 dB",
+      manual_rec["applied_gain_db"] is None)
+# Rows written before migration 035 carry gain_db 0 and a NULL applied gain.
+old_rec = _row_to_dict(row())
+check("a pre-035 row still converts, as a manual 0 dB recording",
+      old_rec["gain_mode"] == "manual" and old_rec["applied_gain_db"] is None)
+
+# The finish report: an older hub never sends applied_gain_db, and must not be
+# rejected for it — that would lose the whole report, not just the gain.
+check("a finish report without applied_gain_db is accepted (older hub)",
+      RecordingFinalizeIn(ok=True).applied_gain_db is None)
+check("a finish report carries the applied gain",
+      RecordingFinalizeIn(ok=True, applied_gain_db=-3).applied_gain_db == -3)
+for _bad in (41, -21):
+    try:
+        RecordingFinalizeIn(ok=True, applied_gain_db=_bad)
+        check(f"an applied gain of {_bad} dB is rejected", False)
+    except Exception:
+        check(f"an applied gain of {_bad} dB is rejected", True)
 
 # ── the command the request actually queues ─────────────────────────────────
 #
@@ -273,6 +354,152 @@ check(f"every hive_recordings migration column is also in init_db "
       f"({'missing: ' + ', '.join(_unapplied) if _unapplied else 'none missing'})",
       not _unapplied)
 
+
+
+# ── The hub hanging up mid-upload ──────────────────────────────────────────
+#
+# A hub whose BLE session fails to start closes the upload ~200 ms in, and
+# behind Traefik even a complete body arrives as a disconnect because the hub
+# does not wait for the response. That used to escape stream_recording as an
+# unhandled ClientDisconnect: a traceback per failed session, and the byte
+# count never written, so audio that had landed was recorded as 0 bytes.
+import asyncio  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+from starlette.requests import ClientDisconnect  # noqa: E402
+
+
+class _FakeCursor:
+    def __init__(self, log):
+        self.log = log
+        self.rowcount = 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.log.append((" ".join(sql.split()), params))
+
+    def fetchone(self):
+        return ("requested",)
+
+
+class _FakeConn:
+    def __init__(self, log):
+        self.log = log
+
+    def cursor(self):
+        return _FakeCursor(self.log)
+
+    def commit(self):
+        pass
+
+
+class _DisconnectingRequest:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    async def stream(self):
+        for c in self.chunks:
+            yield c
+        raise ClientDisconnect()
+
+
+def _run_stream(chunks, recording_id):
+    log = []
+
+    @contextmanager
+    def fake_get_conn():
+        yield _FakeConn(log)
+
+    real = recordings.get_conn
+    recordings.get_conn = fake_get_conn
+    try:
+        out = asyncio.run(recordings.stream_recording(
+            "hive-test", recording_id, _DisconnectingRequest(chunks)))
+    finally:
+        recordings.get_conn = real
+    return out, log
+
+
+for _label, _chunks in (("before any audio", []),
+                        ("mid-session", [b"\x01\x02" * 100, b"\x03" * 56])):
+    _expect = sum(len(c) for c in _chunks)
+    try:
+        _out, _log = _run_stream(_chunks, 9001)
+        _raised = None
+    except Exception as exc:  # noqa: BLE001 - the regression IS an escape
+        _out, _log, _raised = None, [], exc
+    check(f"a hub disconnecting {_label} does not escape stream_recording "
+          f"({type(_raised).__name__ if _raised else 'handled'})",
+          _raised is None)
+    _bytes_updates = [p for sql, p in _log if sql.startswith(
+        "UPDATE hive_recordings SET bytes")]
+    check(f"a hub disconnecting {_label} still records the {_expect} bytes "
+          f"that arrived",
+          bool(_bytes_updates) and _bytes_updates[-1][0] == _expect
+          and _out == {"status": "disconnected", "bytes": _expect})
+    check(f"a hub disconnecting {_label} records the server's own CRC of them",
+          bool(_bytes_updates)
+          and _bytes_updates[-1][1] == zlib.crc32(b"".join(_chunks)))
+    check(f"a hub disconnecting {_label} leaves the error for the hub's own "
+          f"command result to fill",
+          not any(sql.startswith("UPDATE hive_recordings SET error")
+                  for sql, _ in _log))
+    try:
+        _path_for("hive-test", 9001).unlink()
+    except OSError:
+        pass
+
+
+# ── A command result that arrives after the stale sweep ────────────────────
+#
+# A hub that could not post its result right after a failed session holds it
+# for the next cycle, by which time the sweep has failed the row with a guess.
+# The hub's own reason must replace the guess — and only the guess.
+class _LateCursor(_FakeCursor):
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        # The in-flight UPDATE finds nothing: the sweep already closed the row.
+        self.rowcount = 0 if "status IN ('requested', 'streaming')" in sql else 1
+
+
+class _LateConn(_FakeConn):
+    def cursor(self):
+        return _LateCursor(self.log)
+
+
+def _run_late(success, message):
+    log = []
+
+    @contextmanager
+    def fake_get_conn():
+        yield _LateConn(log)
+
+    real = recordings.get_conn
+    recordings.get_conn = fake_get_conn
+    try:
+        recordings.finalize_from_command_result("hive-test", 77, success, message)
+    finally:
+        recordings.get_conn = real
+    return log
+
+
+_reason = "BLE stack would not start [heap free 16284, largest 13812, min 1456]"
+_late = [(sql, p) for sql, p in _run_late(False, _reason)
+         if sql.startswith("UPDATE hive_recordings SET error")]
+check("a late failed command result replaces the stale-sweep message",
+      len(_late) == 1 and _late[0][1][0] == _reason
+      and recordings.SWEEP_NO_AUDIO_MSG in _late[0][1]
+      and "status = 'failed'" in _late[0][0])
+# (A late success may restore a row the sweep wrongly failed — that is a status
+# change with the error cleared, covered in test_recordings_db.py.)
+check("a late successful command result never writes its message as the error",
+      not any(sql.startswith("UPDATE hive_recordings SET error")
+              for sql, _ in _run_late(True, "recorded 1 B")))
 
 if _failures:
     raise SystemExit(f"{_failures} check(s) failed")

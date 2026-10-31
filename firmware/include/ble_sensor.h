@@ -30,6 +30,7 @@
 #if ENABLE_BLE_SCAN
 
 #include <ArduinoJson.h>
+#include <limits.h>   // INT_MIN: "not reported" for Snapshot::tx_power_dbm
 #include <vector>
 
 namespace blesensor {
@@ -81,7 +82,14 @@ struct Snapshot {
   float    mic_high_dbfs     = NAN;  // 1500–3000 Hz
 
   int      battery_pct   = -1;     // -1 = not reported
-  int      battery_mv    = -1;     // HiveInside raw cell voltage in mV (-1 = not reported)
+  int      battery_mv    = -1;     // raw cell voltage in mV (HiveInside, RuuviTag; -1 = not reported)
+
+  // RuuviTag diagnostics: data format (3 = RAWv1, 5 = RAWv2; 0 = not Ruuvi) and
+  // the RAWv2-only fields. INT_MIN / -1 = not reported.
+  int      ruuvi_format   = 0;
+  int      tx_power_dbm   = INT_MIN;
+  int      movement_count = -1;
+  long     sequence       = -1;
 
   // Running firmware version the nRF54 HiveInside advertises in its scan-response
   // identity record (the 'I' manufacturer element). Empty for HolyIot/Ruuvi
@@ -193,6 +201,15 @@ String normalizeMac(const String& raw);
 // compile on devices built without ENABLE_BLE_SCAN.
 bool locateByScan(const String& mac, uint8_t& addrTypeOut);
 #endif  // HIVEINSIDE_OTA_ENABLED || HIVEINSIDE_AUDIO_ENABLED
+
+#if HIVEINSIDE_AUDIO_ENABLED
+// The firmware version ("major.minor.patch") a HiveInside at `mac` advertised in
+// its identity record during any scan this boot, or "" when none was heard —
+// a passive scan, a node out of range this cycle, or not a HiveInside at all.
+// The audio relay uses it to decide whether the node's DATA header carries the
+// applied gain (HiveInside 0.8.0+).
+String knownFirmwareVersion(const String& mac);
+#endif  // HIVEINSIDE_AUDIO_ENABLED
 
 }  // namespace blesensor
 

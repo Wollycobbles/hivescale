@@ -1,29 +1,29 @@
-import os
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Iterable, Literal, Optional
 
 from fastapi import (
     APIRouter,
     Depends,
-    File,
-    Form,
     HTTPException,
     Query,
     Request,
     Response,
-    UploadFile,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
+from psycopg import errors as pg_errors
 
 from auth import (
     create_dashboard_session_token,
     create_dashboard_user,
+    current_dashboard_session,
     dashboard_admin_count,
+    dashboard_email_taken,
     dashboard_user_count,
-    decode_dashboard_session_token,
     delete_dashboard_user,
     get_dashboard_user_by_username,
+    get_dashboard_users_by_email,
     list_dashboard_users,
     require_dashboard_admin,
     require_dashboard_session,
@@ -34,6 +34,7 @@ from auth import (
     set_dashboard_user_password,
     touch_dashboard_user_login,
     verify_password,
+    UNUSABLE_PASSWORD,
     _public_dashboard_user,
 )
 from recordings import (
@@ -51,10 +52,11 @@ from commands import (
     latest_hiveinside_relays,
     queue_relay_firmware_update,
 )
+import oidc
 from config import (
-    DASHBOARD_SESSION_COOKIE,
     ENABLE_PUBLIC_EMBEDS,
     NOTIFY_MIN_SEVERITY,
+    SD_IMPORT_MAX_FILE_SIZE,
     VAPID_PUBLIC_KEY,
 )
 from data_export import (
@@ -80,6 +82,7 @@ from devices import (
     update_device_config,
 )
 from firmware import (
+    FIRMWARE_UPLOAD_OPENAPI,
     get_approved_firmware_version,
     get_device_board,
     latest_beecounter_release,
@@ -87,6 +90,7 @@ from firmware import (
     latest_release_for_owner,
     other_board_releases,
     parse_version,
+    read_firmware_upload_form,
     set_approved_firmware_version,
     store_firmware_upload,
 )
@@ -102,7 +106,9 @@ from measurements import (
     CHART_MEASUREMENT_COLUMNS,
     MEASUREMENT_SELECT_COLUMNS,
     bulk_import_measurements,
+    daily_weight_extremes,
     execute_measurement_query,
+    fetch_chart_rows,
     serialize_chart_measurements,
     serialize_measurements,
 )
@@ -141,6 +147,7 @@ from inspections import (
     stop_inspection_for_device,
     update_inspection,
 )
+from uploads import form_bool, form_file, multipart_openapi, read_upload_bytes, read_upload_form
 from sd_import import (
     distinct_source_device_ids,
     group_records_by_device,
@@ -184,7 +191,7 @@ def dashboard_features() -> dict:
 @router.get("/api/v1/local/auth/status", dependencies=LOCAL_DASHBOARD_AUTH_DEP)
 def local_auth_status(request: Request):
     """Tell the dashboard whether to show the setup wizard, login, or the app."""
-    payload = decode_dashboard_session_token(request.cookies.get(DASHBOARD_SESSION_COOKIE, ""))
+    payload = current_dashboard_session(request)
     user = None
     if payload:
         # Read the live row so the email (which can change after login) is fresh.
@@ -194,10 +201,15 @@ def local_auth_status(request: Request):
             if record
             else {"username": payload["username"], "role": payload["role"]}
         )
+    if user is not None:
+        user["auth"] = payload.get("auth", "password")
     result = {
         "setup_required": dashboard_user_count() == 0,
         "authenticated": bool(payload),
         "user": user,
+        # Pre-login: whether to offer "Sign in with <provider>" and/or the
+        # password form.
+        "sso": oidc.sso_features(),
     }
     if payload:
         # Ship the device list with the auth check so an already-signed-in
@@ -209,17 +221,34 @@ def local_auth_status(request: Request):
 
 @router.post("/api/v1/local/auth/setup", dependencies=LOCAL_DASHBOARD_AUTH_DEP)
 def local_auth_setup(body: DashboardSetupIn, response: Response):
-    """First-run wizard: create the initial admin. No-op once any account exists."""
+    """First-run wizard: create the initial admin. No-op once any account exists.
+
+    With password login disabled (SSO only) the admin is created without a
+    password and no session is issued: the dashboard sends the browser through
+    the SSO login, which then has to map the given e-mail to this account.
+    """
     if dashboard_user_count() > 0:
         raise HTTPException(status_code=409, detail="Setup has already been completed")
-    user = create_dashboard_user(body.username, body.password, "admin", body.email)
-    touch_dashboard_user_login(user["id"])
-    set_dashboard_session_cookie(response, create_dashboard_session_token(user))
-    return {"user": _public_dashboard_user(user), "features": dashboard_features()}
+    if oidc.password_login_enabled():
+        if not body.password:
+            raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
+        user = create_dashboard_user(body.username, body.password, "admin", body.email)
+        touch_dashboard_user_login(user["id"])
+        set_dashboard_session_cookie(response, create_dashboard_session_token(user))
+        return {"user": _public_dashboard_user(user), "features": dashboard_features()}
+    if not body.email:
+        raise HTTPException(
+            status_code=422,
+            detail=f"An email address is required: it is how {oidc.OIDC_PROVIDER_NAME} sign-in finds this account",
+        )
+    user = create_dashboard_user(body.username, None, "admin", body.email)
+    return {"user": _public_dashboard_user(user), "sso_login": True}
 
 
 @router.post("/api/v1/local/auth/login", dependencies=LOCAL_DASHBOARD_AUTH_DEP)
 def local_auth_login(body: DashboardLoginIn, response: Response):
+    if not oidc.password_login_enabled():
+        raise HTTPException(status_code=403, detail="Password sign-in is disabled; use single sign-on")
     user = get_dashboard_user_by_username(body.username)
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -229,20 +258,102 @@ def local_auth_login(body: DashboardLoginIn, response: Response):
 
 
 @router.post("/api/v1/local/auth/logout", dependencies=LOCAL_DASHBOARD_AUTH_DEP)
-def local_auth_logout(response: Response):
+def local_auth_logout(request: Request, response: Response):
+    """Clear the session. For an SSO session the response also carries the
+    provider's end-session URL, so the dashboard can sign the user out there
+    too (RP-initiated logout) instead of leaving the provider session alive."""
+    payload = current_dashboard_session(request)
     clear_dashboard_session_cookie(response)
-    return {"ok": True}
+    result = {"ok": True}
+    if payload and payload.get("auth") == "oidc" and oidc.oidc_configured():
+        url = oidc.end_session_url(request, payload.get("idt"))
+        if url:
+            result["redirect"] = url
+    return result
+
+
+# ── Single sign-on (OpenID Connect, e.g. authentik) ──────────────────────────
+# Both endpoints are plain browser navigations (not fetch calls), so failures
+# are reported by redirecting back to the dashboard with ?sso_error=<code>.
+
+
+@router.get("/api/v1/local/auth/oidc/login", dependencies=LOCAL_DASHBOARD_AUTH_DEP)
+def local_auth_oidc_login(request: Request):
+    if not oidc.oidc_configured():
+        return RedirectResponse(oidc.dashboard_error_redirect("disabled"), status_code=303)
+    response = RedirectResponse("", status_code=303)
+    try:
+        response.headers["location"] = oidc.start_login(request, response)
+    except oidc.OIDCError as exc:
+        oidc.logger.warning("SSO login could not start: %s", exc)
+        return RedirectResponse(oidc.dashboard_error_redirect(exc.code), status_code=303)
+    return response
+
+
+@router.get("/api/v1/local/auth/oidc/callback", dependencies=LOCAL_DASHBOARD_AUTH_DEP)
+def local_auth_oidc_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    error_description: str = "",
+):
+    def fail(code_: str) -> RedirectResponse:
+        resp = RedirectResponse(oidc.dashboard_error_redirect(code_), status_code=303)
+        oidc.clear_flow_cookie(resp)
+        return resp
+
+    if not oidc.oidc_configured():
+        return fail("disabled")
+    if error:
+        # The provider refused (user cancelled, application policy denied, …).
+        oidc.logger.info("SSO provider returned error %s: %s", error, error_description[:300])
+        return fail("denied" if error == "access_denied" else "provider")
+    try:
+        email, id_token = oidc.complete_login(request, code, state)
+    except oidc.OIDCError as exc:
+        oidc.logger.warning("SSO login failed (%s): %s", exc.code, exc)
+        return fail(exc.code)
+    matches = get_dashboard_users_by_email(email)
+    if not matches:
+        oidc.logger.info("SSO login refused: no dashboard account has the email %s", email)
+        return fail("unknown_user")
+    if len(matches) > 1:
+        oidc.logger.warning("SSO login refused: several dashboard accounts share the email %s", email)
+        return fail("ambiguous")
+    user = matches[0]
+    touch_dashboard_user_login(user["id"])
+    response = RedirectResponse(oidc.DASHBOARD_PATH, status_code=303)
+    oidc.clear_flow_cookie(response)
+    set_dashboard_session_cookie(
+        response, create_dashboard_session_token(user, auth_method="oidc", id_token=id_token)
+    )
+    return response
 
 
 @router.post("/api/v1/local/auth/password")
 def local_auth_change_password(
-    body: DashboardChangePasswordIn, session: dict = Depends(require_dashboard_session)
+    body: DashboardChangePasswordIn,
+    response: Response,
+    session: dict = Depends(require_dashboard_session),
 ):
-    """Change the logged-in user's own password (re-auth with current password)."""
+    """Change the logged-in user's own password (re-auth with current password).
+
+    Every other session of the account is revoked; this browser gets a fresh
+    one so the user stays signed in here."""
+    if not oidc.password_login_enabled():
+        raise HTTPException(status_code=403, detail="Password sign-in is disabled; use single sign-on")
     user = get_dashboard_user_by_username(session["username"])
     if not user or not verify_password(body.current_password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
-    set_dashboard_user_password(user["id"], body.new_password)
+    updated = set_dashboard_user_password(user["id"], body.new_password)
+    if updated:
+        set_dashboard_session_cookie(
+            response,
+            create_dashboard_session_token(
+                updated, auth_method=session.get("auth", "password"), id_token=session.get("idt")
+            ),
+        )
     return {"ok": True}
 
 
@@ -259,7 +370,17 @@ def local_auth_update_email(
     user = get_dashboard_user_by_username(session["username"])
     if not user:
         raise HTTPException(status_code=404, detail="Account not found")
-    set_dashboard_user_email(user["id"], body.email)
+    if oidc.oidc_configured() and not body.email and user["password_hash"] == UNUSABLE_PASSWORD:
+        # The e-mail is the only way an SSO-only account can sign in.
+        raise HTTPException(
+            status_code=400, detail="This account signs in via single sign-on, so it needs an email address"
+        )
+    if body.email and dashboard_email_taken(body.email, exclude_id=user["id"]):
+        raise HTTPException(status_code=409, detail="That email address is already used by another account")
+    try:
+        set_dashboard_user_email(user["id"], body.email)
+    except pg_errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="That email address is already used by another account")
     return {"ok": True, "email": body.email}
 
 
@@ -323,12 +444,29 @@ def local_list_dashboard_users():
 
 @router.post("/api/v1/local/auth/users", dependencies=LOCAL_DASHBOARD_ADMIN_DEP)
 def local_create_dashboard_user(body: DashboardCreateUserIn):
-    """Create a new dashboard account with the admin or viewer role (admin only)."""
+    """Create a new dashboard account with the admin or viewer role (admin only).
+
+    Without a password the account is SSO-only: it signs in through the OIDC
+    provider, matched by its e-mail. That is only allowed while SSO is enabled,
+    and when password login is disabled every new account is SSO-only.
+    """
+    password = body.password if oidc.password_login_enabled() else None
+    if not password:
+        if not oidc.oidc_configured():
+            raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
+        if not body.email:
+            raise HTTPException(
+                status_code=422, detail="Single sign-on accounts need an email address to be matched by"
+            )
     if get_dashboard_user_by_username(body.username):
         raise HTTPException(status_code=409, detail="That username is already taken")
-    return _public_dashboard_user(
-        create_dashboard_user(body.username, body.password, body.role, body.email)
-    )
+    if body.email and dashboard_email_taken(body.email):
+        raise HTTPException(status_code=409, detail="That email address is already used by another account")
+    try:
+        user = create_dashboard_user(body.username, password, body.role, body.email)
+    except pg_errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="That username or email address is already in use")
+    return _public_dashboard_user(user)
 
 
 @router.delete("/api/v1/local/auth/users/{user_id}")
@@ -458,7 +596,30 @@ def local_list_measurements(
             execute_measurement_query(
                 cur, CHART_MEASUREMENT_COLUMNS, where_parts, params, limit, max_points
             )
-            return serialize_chart_measurements(cur)
+            rows = fetch_chart_rows(cur)
+    return serialize_chart_measurements(rows)
+
+
+@router.get("/api/v1/local/devices/{device_id}/measurements/daily-weight", dependencies=LOCAL_DASHBOARD_DEP)
+def local_daily_weight(
+    device_id: str,
+    start_at: datetime,
+    end_at: Optional[datetime] = None,
+    tz: str = "UTC",
+):
+    """Highest and lowest weight per hive and calendar day, from every reading.
+
+    Backs the "Daily max weight" chart. The time-series endpoint above thins a
+    long range to ~1500 evenly spaced readings, and a daily maximum taken over
+    those misses every peak that fell between two kept readings. ``tz`` is the
+    IANA zone whose midnight separates the days (the browser's own).
+    """
+    try:
+        zone = ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise HTTPException(status_code=422, detail=f"Unknown time zone {tz!r}")
+    days = daily_weight_extremes(device_id, start_at, end_at, zone)
+    return {"device_id": device_id, "tz": tz, "days": days}
 
 
 @router.get("/api/v1/local/devices/{device_id}/measurements/latest", dependencies=LOCAL_DASHBOARD_DEP)
@@ -667,31 +828,20 @@ def local_export_measurements(
     )
 
 
-# SD backup uploads are fully buffered in memory, so cap the upload size to
-# avoid excessive memory usage / DoS from oversized files. Overridable via env
-# var to allow tuning without a code change (mirrors the HivePal proxy's cap).
-SD_IMPORT_MAX_FILE_SIZE = int(
-    os.environ.get("HIVEHUB_SD_IMPORT_MAX_FILE_SIZE", str(250 * 1024 * 1024))
-)
-
-
 @router.post(
     "/api/v1/local/devices/{device_id}/measurements/import",
     dependencies=LOCAL_DASHBOARD_ADMIN_DEP,
+    openapi_extra=multipart_openapi({"file": "binary", "force": "boolean", "route_by_device": "boolean"},
+                                    required=["file"]),
 )
-async def local_import_sd_measurements(
-    device_id: str,
-    file: UploadFile = File(...),
-    force: bool = Form(False),
-    route_by_device: bool = Form(False),
-):
+async def local_import_sd_measurements(device_id: str, request: Request):
     """Import measurements from an SD-card backup pulled off the scale in AP mode.
 
     Accepts either the raw ``measurements.ndjson`` or the
     ``hivescale-sd-data.tar`` download. The file is parsed server-side into
     measurement records, each row is pinned to the path ``device_id``, and the
-    batch is de-duplicated on ``(device_id, measured_at)`` so re-uploading the
-    same file inserts nothing. Mirrors the HivePal SD-upload feature for the
+    batch is de-duplicated on each row's ``measurement_id`` (``measured_at`` for
+    legacy rows) so re-uploading the same file inserts nothing. Mirrors the HivePal SD-upload feature for the
     self-hosted dashboard that ships with HiveHub.
 
     Because every row is re-pinned to the path ``device_id``, uploading a card
@@ -711,17 +861,14 @@ async def local_import_sd_measurements(
     claim/check-in flow, and inventing one from an uploaded file would fabricate
     a device with no key and no owner.
     """
-    data = await file.read()
+    # Parsed here, after the admin check, not as File()/Form() parameters: see uploads.py.
+    form = await read_upload_form(request)
+    file = form_file(form)
+    force = form_bool(form, "force", False)
+    route_by_device = form_bool(form, "route_by_device", False)
+    data = await read_upload_bytes(file, SD_IMPORT_MAX_FILE_SIZE, "SD file")
     if not data:
         raise HTTPException(status_code=400, detail="No SD data file provided")
-    if len(data) > SD_IMPORT_MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"SD file exceeds the {SD_IMPORT_MAX_FILE_SIZE // (1024 * 1024)} MB "
-                "upload limit"
-            ),
-        )
 
     records, skipped = parse_sd_measurements(data, file.filename)
 
@@ -1155,9 +1302,13 @@ def local_insights_history(
              dependencies=LOCAL_DASHBOARD_ADMIN_DEP)
 def local_request_recording(device_id: str, hive: int = Query(1),
                             duration: float = Query(0.0),
-                            gain_db: int = Query(0),
+                            gain_db: Optional[int] = Query(None),
                             user=Depends(require_dashboard_admin)):
     """Ask a hive for audio. ``duration=0`` is live (the node stops at 60 s).
+
+    Omit ``gain_db`` (or send 127) for automatic gain; otherwise -20..+40 dB.
+    Nodes older than HiveInside 0.8.0 cap a fixed gain at +20 dB and treat
+    automatic as +20 dB.
 
     Returns as soon as the command is queued — the hub deep-sleeps and only
     picks it up on its next wake, so the caller polls the returned recording
@@ -1266,21 +1417,16 @@ def local_firmware_status(device_id: str):
     }
 
 
-@router.post("/api/v1/local/devices/{device_id}/firmware", dependencies=LOCAL_DASHBOARD_ADMIN_DEP)
-async def local_upload_firmware(
-    device_id: str,
-    file: UploadFile = File(...),
-    version: str = Form(...),
-    target: str = Form("hivescale"),
-    active: bool = Form(True),
-    board: str = Form(""),
-):
+@router.post("/api/v1/local/devices/{device_id}/firmware", dependencies=LOCAL_DASHBOARD_ADMIN_DEP,
+             openapi_extra=FIRMWARE_UPLOAD_OPENAPI)
+async def local_upload_firmware(device_id: str, request: Request):
     """Upload a firmware binary and register it as a GLOBAL release.
 
     In single-owner local mode there is no per-user scoping, so the release is
     left owner-less (owner_user_id=None) and every device on this server can pick
     it up after it is approved.
     """
+    file, version, target, active, board = await read_firmware_upload_form(request)
     return await store_firmware_upload(
         device_id, file, version, target, active, board, owner_user_id=None
     )

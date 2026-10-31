@@ -67,19 +67,23 @@ void initializeTime(bool wokeFromDeepSleep) {
 // long evenings when there is most of it. The TZ string carries the DST rules,
 // so the window tracks the clock on the wall all year.
 
-// Push the configured POSIX TZ into the C library, when it changes. Cheap and
+// Push the configured POSIX TZ into the C library, when it differs. Cheap and
 // idempotent: called from the accessor below rather than from a setup path, so
 // no ordering between "config arrived" and "window evaluated" can leave a stale
 // zone in place.
+//
+// It compares against the live TZ variable rather than remembering what it set
+// last: configTime(0, 0, ...) — run by every NTP sync — quietly puts the process
+// back on UTC, and a cached "already applied" would then evaluate the night
+// window in UTC until the next reboot.
+//
+// Nothing else may read local time: upload timestamps are built from gmtime_r
+// (timestampNow), so the zone set here can never leak into them.
 static void applyNightTimezone() {
-  static String applied = "\x01";   // impossible value: forces the first apply
-  if (applied == nightTimezone) return;
-  applied = nightTimezone;
-  if (nightTimezone.length()) {
-    setenv("TZ", nightTimezone.c_str(), 1);
-  } else {
-    setenv("TZ", "UTC0", 1);
-  }
+  const char* want = nightTimezone.length() ? nightTimezone.c_str() : "UTC0";
+  const char* have = getenv("TZ");
+  if (have && strcmp(have, want) == 0) return;
+  setenv("TZ", want, 1);
   tzset();
   Serial.printf("[TIME] Timezone set to %s\n",
                 nightTimezone.length() ? nightTimezone.c_str() : "UTC");
@@ -127,11 +131,19 @@ String timestampNow() {
     }
   }
 
+  // System clock (NTP). getLocalTime() only waits for a valid clock here; the
+  // timestamp itself is formatted from gmtime_r, because local time is whatever
+  // zone applyNightTimezone() last set and the "Z" below promises UTC. Using
+  // getLocalTime's result, as this did, shifted the timestamp by the zone's
+  // offset once night mode had applied a non-UTC zone in the same awake cycle.
   struct tm tmNow;
   if (getLocalTime(&tmNow, 100)) {
-    char buf[25];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ", tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday, tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
-    return String(buf);
+    const time_t epoch = time(nullptr);
+    if (gmtime_r(&epoch, &tmNow) != nullptr) {
+      char buf[25];
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ", tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday, tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
+      return String(buf);
+    }
   }
 
   return String("1970-01-01T00:00:00Z");
@@ -604,19 +616,46 @@ void buildMeasurementDoc(JsonDocument& doc) {
 
   // ── Wired stereo mics (device-level; left=hive 1, right=hive 2) ────────────
 #if ENABLE_INMP441_MICS
-  bool wiredMicUsed = true;
+  // Per hive, like every other arbitrated sensor: a BLE microphone in hive 1
+  // supersedes the LEFT wired channel only, and one in hive 2 the RIGHT. The
+  // stereo capture is a single I2S read either way, so it runs whenever either
+  // hive still needs its wired channel — dropping it because ONE hive had a BLE
+  // mic used to cost the other hive its acoustics entirely.
+  bool wiredLeftUsed = true, wiredRightUsed = true;
 #if ENABLE_BLE_SCAN
   if (BLE_OVERRIDE_MICS) {
     const blesensor::Snapshot* s1 = snapForHive(bleHiveOfMac, bleSnaps, 0);
     const blesensor::Snapshot* s2 = snapForHive(bleHiveOfMac, bleSnaps, 1);
-    if ((s1 && s1->providesMic()) || (s2 && s2->providesMic())) {
-      wiredMicUsed = false;
-      Serial.println("[ARB] BLE supplies in-hive acoustics; skipping wired INMP441 mics");
+    if (s1 && s1->providesMic()) {
+      wiredLeftUsed = false;
+      Serial.println("[ARB] hive 1: BLE supplies in-hive acoustics; skipping left wired mic");
+    }
+    if (s2 && s2->providesMic()) {
+      wiredRightUsed = false;
+      Serial.println("[ARB] hive 2: BLE supplies in-hive acoustics; skipping right wired mic");
     }
   }
 #endif
+  const bool wiredMicUsed = wiredLeftUsed || wiredRightUsed;
   MicMeasurement micResult;
   if (wiredMicUsed) micResult = readMicSamples();
+  // Release the I2S channel the moment the samples are in hand, rather than
+  // leaving it to the deep-sleep prep in storage_power.cpp.
+  //
+  // The channel holds dma_desc_num * dma_frame_num * slots * 4 B — 8 kB with
+  // the settings in mics.cpp — of DMA-capable internal RAM, which is exactly
+  // the memory the BT controller needs when the audio relay asks for the radio
+  // later in the same cycle. Held to deep sleep it was resident through the
+  // whole of that, and on the classic ESP32 it is resident on top of a heap the
+  // 2048-point double-precision FFT above has just finished fragmenting. The
+  // C6 pays neither cost: config.h forces ENABLE_INMP441_MICS off there, which
+  // is a large part of why the same relay starts on one board and not the other.
+  //
+  // Unconditional and idempotent: shutdownMicsI2s() returns immediately when
+  // nothing is installed, which covers the BLE-override path above. The next
+  // cycle is a fresh boot out of deep sleep, and readMicSamples() installs the
+  // channel itself, so nothing here needs to put it back.
+  shutdownMicsI2s();
 #endif
 
   // ── BeeCounter (entrance gates) — BLE/GATT only ────────────────────────────
@@ -643,8 +682,8 @@ void buildMeasurementDoc(JsonDocument& doc) {
   doc["ambient_humidity_percent"] = ambientHumidity;
 #if AMBIENT_HAS_PRESSURE
   // Barometric pressure from a pressure-capable ambient sensor (BME280). Emitted
-  // only when such a sensor is compiled; the ingest schema ignores it if the
-  // backend has no ambient_pressure_hpa column yet, so this is upload-safe.
+  // only when such a sensor is compiled. Stored by server 0.6.2+; older servers
+  // ignore the unknown field, so this is upload-safe either way.
   doc["ambient_pressure_hpa"] = ambientPressure;
 #endif
   doc["network_transport"] = "wifi";
@@ -673,7 +712,7 @@ void buildMeasurementDoc(JsonDocument& doc) {
   // because the read failed (e.g. a wedged C6 I2C driver), never the boot-time
   // detection result. sht_detected preserves that detection/initialization
   // diagnostic separately (the field names stay sht_* for backend compatibility;
-  // the backend ignores unknown fields, so this is upload-safe).
+  // stored by server 0.6.2+, ignored as an unknown field by older servers).
   doc["sht_ok"] = shtRead;
   doc["sht_detected"] = shtOk;
 #if ENABLE_INA219_SOLAR
@@ -695,19 +734,26 @@ void buildMeasurementDoc(JsonDocument& doc) {
     doc["mic_ok"]                   = micResult.ok;
     doc["mic_sample_rate_hz"]       = (uint32_t)INMP441_SAMPLE_RATE;
     doc["mic_sample_frames"]        = (uint32_t)INMP441_SAMPLE_FRAMES;
+  }
+  // Only the channel a hive still takes from the wire: a superseded channel is
+  // left out, so it can never sit beside that hive's BLE acoustics as a
+  // second, conflicting reading.
+  if (wiredLeftUsed) {
     doc["mic_left_ok"]              = micResult.left.ok;
     doc["mic_left_rms_dbfs"]        = micResult.left.rmsDbfs;
     doc["mic_left_peak_dbfs"]       = micResult.left.peakDbfs;
     doc["mic_left_rms_normalized"]  = micResult.left.rmsNormalized;
-    doc["mic_right_ok"]             = micResult.right.ok;
-    doc["mic_right_rms_dbfs"]       = micResult.right.rmsDbfs;
-    doc["mic_right_peak_dbfs"]      = micResult.right.peakDbfs;
-    doc["mic_right_rms_normalized"] = micResult.right.rmsNormalized;
     doc["mic_left_band_sub_bass_dbfs"]  = micResult.left.bands.sub_bass_dbfs;
     doc["mic_left_band_hum_dbfs"]       = micResult.left.bands.hum_dbfs;
     doc["mic_left_band_piping_dbfs"]    = micResult.left.bands.piping_dbfs;
     doc["mic_left_band_stress_dbfs"]    = micResult.left.bands.stress_dbfs;
     doc["mic_left_band_high_dbfs"]      = micResult.left.bands.high_dbfs;
+  }
+  if (wiredRightUsed) {
+    doc["mic_right_ok"]             = micResult.right.ok;
+    doc["mic_right_rms_dbfs"]       = micResult.right.rmsDbfs;
+    doc["mic_right_peak_dbfs"]      = micResult.right.peakDbfs;
+    doc["mic_right_rms_normalized"] = micResult.right.rmsNormalized;
     doc["mic_right_band_sub_bass_dbfs"] = micResult.right.bands.sub_bass_dbfs;
     doc["mic_right_band_hum_dbfs"]      = micResult.right.bands.hum_dbfs;
     doc["mic_right_band_piping_dbfs"]   = micResult.right.bands.piping_dbfs;
@@ -821,8 +867,10 @@ void buildMeasurementDoc(JsonDocument& doc) {
     // registry position, matching this loop. A hive emits a bee_counter object
     // only when it actually has a paired HiveTraffic counter — present data
     // when the read succeeded, ok:false when the paired counter was
-    // unreachable this cycle. Hives without a pairing report nothing (there is
-    // no wired path and no implicit hive-1/2 counter anymore).
+    // unreachable this cycle, and ok:false + polled:false when the read
+    // rotation did not get to it this wake (a schedule, not a fault). Hives
+    // without a pairing report nothing (there is no wired path and no implicit
+    // hive-1/2 counter anymore).
     // The paired MAC comes from the registry rather than the snapshot: it is
     // configuration, it is known whether or not the counter answered, and
     // keeping it out of beecnt::Snapshot keeps that MAX_HIVES-sized stack array

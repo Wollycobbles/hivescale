@@ -1,6 +1,7 @@
 # Listening to a hive
 
-*Firmware **0.30.2** · server **0.5.2** · HiveInside **0.6.2** · issue [#71](https://github.com/MacNite/HiveInside/issues/71)*
+*Firmware **0.30.2** · server **0.5.2** · HiveInside **0.6.2** · issue [#71](https://github.com/MacNite/HiveInside/issues/71)
+· automatic gain: firmware **0.33.0** · server **0.7.0** · HiveInside **0.8.0** · issue [HiveInside#78](https://github.com/MacNite/HiveInside/issues/78)*
 
 A HiveInside node can be asked to record from inside
 the hive. The hub relays the audio to the backend as it is captured, and the
@@ -20,6 +21,12 @@ PDM mic → PCM16 → 32 KiB ring → BLE notify → 32 KiB ring → chunked POS
 > sent did arrive. If a recording plays for a moment and then goes silent, check
 > the node's version before anything else. HiveInside's
 > `docs/audio-over-ble.md` has the mechanism.
+
+> **Automatic gain needs HiveInside 0.8.0** for the node to choose the level;
+> an older node treats an automatic request as a fixed **+20 dB** (louder, never
+> refused). The applied gain is only *reported* with **hub firmware 0.33.0**
+> talking to a 0.8.0 node, and with **server 0.7.0** to store it; with anything
+> older the recording simply shows `auto` with no number.
 
 This is the firmware-over-BLE relay in reverse, and deliberately so: the same
 locate-scan, the same NimBLE client shape, the same crash-safe command
@@ -128,7 +135,8 @@ container recreation.
 ## Using it
 
 **Dashboard → Audio → "Hive audio".** Pick a hive, pick a length (10, 30 or 60
-seconds), press **Record**. Then the part that surprises people:
+seconds), leave the gain on **Auto**, press **Record**. Then the part that
+surprises people:
 
 > **It is not instant.** The hub deep-sleeps and only collects commands on its
 > next wake, so a recording arrives within one reporting interval — minutes,
@@ -155,6 +163,25 @@ sounds perfectly continuous.
 Only hives with a HiveInside are offered. Nothing else on a hub has a
 microphone, and a request against a HolyIot or RuuviTag could only fail a wake
 cycle later.
+
+### Gain: automatic by default
+
+At a fixed 0 dB a hive is close to inaudible — the complaint in
+[HiveInside#78](https://github.com/MacNite/HiveInside/issues/78) — and the right
+fixed level depends on the colony, the mounting and the season. So the default
+is **Auto**: the node buffers the first 500 ms of the clip, measures its RMS and
+peak, and picks **one whole-dB gain for the whole clip** — the boost that brings
+the RMS to −20 dBFS, stopping before the peak passes −3 dBFS, never below 0 dB
+and never above +40 dB. It does not change during the clip, so levels inside one
+recording are comparable.
+
+The price is a short lead-in: with Auto the first audio leaves the node about
+0.7 s after the session starts (200 ms of microphone warm-up, which every 0.8.0
+session discards, plus the 500 ms measurement). The hub waits 8 s for audio
+before calling a session stalled, so this is well inside it.
+
+A fixed gain (0 to +40 dB) is still offered for experiments. Nodes older than
+HiveInside 0.8.0 cap any fixed gain at +20 dB.
 
 Shorter is usually better: 10–20 seconds is enough to hear what an insight
 flagged, and costs proportionally less battery and less time with the hive off
@@ -188,9 +215,16 @@ judgement made on a splice is wrong in a way nothing later reveals.
 | `gaps` | Gaps | Sequence jumps on the air, or the node's own `FLAG_GAP` | Packets vanished between the node's radio and the hub's |
 | `ring_overruns` | Hub buffer | The hub's staging ring refused a notification because the upload was behind | The hub's WiFi or backend, not the hive |
 | CRC mismatch | Checksum | What arrived is not what the node computed: corruption in transit | |
-| `clipped_pct` | Clipping | Samples hit the rail; lower the gain | |
+| `clipped_pct` | Clipping | Samples hit the rail. With a fixed gain: lower it. With Auto: something louder than the first half second came along — record again, or pick a fixed lower gain | |
+| `gain_mode` / `applied_gain_db` | Gain | `auto → +33 dB`: automatic, and the node reported what it chose. `auto`: automatic, applied gain unknown (node older than 0.8.0, or hub older than 0.33.0). `+20 dB`: a fixed gain | |
 
 Audio either side of a gap is real. The join is not.
+
+**Comparing clips.** With automatic gain, two recordings of the same hive can be
+made at different levels. `applied_gain_db` is what makes them comparable again:
+divide each clip's samples by `10^(applied_gain_db / 20)` to bring it back to
+0 dB before comparing levels. A clip whose `applied_gain_db` is NULL cannot be
+normalised this way.
 
 `gaps` and `ring_overruns` were **one summed field** up to firmware 0.30.1, which
 made the only question a field report actually asks — was that the radio or the
@@ -206,8 +240,8 @@ the dashboard shows as the *Checksum* figure.
 
 | Value | Shown as | What happened |
 |---|---|---|
-| `verified` | verified | The detailed `/finalize` report arrived and its CRC matched what the server computed over the bytes on disk |
-| `reported` | unverified | `/finalize` arrived, but the CRCs disagree or the hub sent none. Only a CRC that actually disagrees marks the recording incomplete — an absent one is not evidence of damage |
+| `verified` | verified | The detailed `/finalize` report arrived, the node's and hub's CRCs agree, and the hub's CRC (and byte count) match what the server computed over the bytes on disk |
+| `reported` | unverified | `/finalize` arrived, but a CRC or length disagrees, or a CRC is missing — an older hub, or a recording stored before server 0.7.1 began computing its own. Only a value that actually disagrees marks the recording incomplete — an absent one is not evidence of damage |
 | `confirmed` | hub confirmed | `/finalize` never arrived, but the hub's **command result** said the session succeeded. Nothing checked the bytes, but the hub did say it finished |
 | `unknown` | not confirmed | Neither report arrived. The audio on disk plays; nothing corroborates it |
 
@@ -237,12 +271,17 @@ Three surfaces, the same functions behind each: master key
 
 | Endpoint | Purpose |
 |---|---|
-| `POST …/devices/{id}/commands/record-audio?slot=&duration=&gain_db=` | queue a session; `duration=0` is live |
+| `POST …/devices/{id}/commands/record-audio?slot=&duration=&gain_db=` | queue a session; `duration=0` is live. Omit `gain_db` (or send `127`) for automatic gain; otherwise −20…+40 dB |
 | `GET …/devices/{id}/recordings` | list, newest first, optionally `?hive=` |
 | `GET …/recordings/{id}` | one recording's metadata and quality flags |
 | `GET …/recordings/{id}/pcm?offset=` | raw PCM from an offset — reads a session while it is still being written; 204 means "nothing new yet". Not used by the dashboard; see "Why this is not live listening" above |
 | `GET …/recordings/{id}/audio.wav` | the finished recording, playable anywhere |
 | `DELETE …/recordings/{id}` | remove the row and its audio |
+
+Each recording carries `gain_db` (the request, `127` = automatic),
+`gain_mode` (`"auto"` / `"manual"`, so clients never need the sentinel) and
+`applied_gain_db` (the gain the node reports it applied, NULL when unknown).
+Before server 0.7.0 an omitted `gain_db` meant a fixed 0 dB.
 
 Requesting audio needs the admin role on the dashboard, or owner/admin in
 HivePal. Listening to what already exists follows the usual per-device roles.
@@ -311,6 +350,113 @@ If you see a reset on 0.30.1 or later, the serial log is the place to look:
 `platformio.ini`, so a panic prints a decoded backtrace rather than raw hex.
 
 
+## Why this is a 30-pin ESP32 problem
+
+A field report on 0.30.4 had a hub fail every recording with
+
+```
+[HEAP] audio-start: free=91296 largest=63476 min_ever=28084
+E NimBLEDevice: esp_nimble_hci_init() failed; err=257
+[HI-AUD] BLE stack would not start ... (free heap 16284, largest block 13812)
+```
+
+`err=257` is `ESP_ERR_NO_MEM`. The same firmware and the same hive worked on an
+ESP32-C6. Four things differ, and only the last is about the silicon:
+
+* **The classic board compiles a sensor path the C6 does not.** `config.h`
+  forces `ENABLE_INMP441_MICS` off on the C6. On `esp32dev` every cycle runs a
+  2048-point FFT in double precision — `vReal` and `vImag` are 16 kB each — plus
+  two 8 kB sample buffers. They are all freed, so they cost no *space*; what
+  they leave behind is **fragmentation**, which is why `audio-start` above shows
+  91 kB free but only 63 kB in one piece.
+* **The mic's I2S channel used to stay resident all cycle.** It was released in
+  the deep-sleep prep, which is why `[INMP441] I2S uninstalled` printed *after*
+  `[SLEEP]`. That is 8 kB of DMA-capable internal RAM held through the TLS
+  handshake and the BLE init. Since 0.30.6 it is released as soon as the
+  samples are read.
+* **`esp32dev` asked for a bigger NimBLE mbuf pool.** `platformio.ini` set
+  `CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=48` there where the C6 takes 24 from its
+  own sdkconfig. The irony was in the reason: the pool was raised *because* the
+  classic ESP32 is dual-core and its NimBLE host task competes with the WiFi
+  driver for core 0. The property that forced the larger pool onto that board is
+  the one that made it hardest to afford. 0.30.7 lowers it to 24.
+* **Less usable DRAM, and a bigger controller.** The classic ESP32's SRAM is
+  split with a fixed IRAM/DRAM boundary, and the shipped framework builds its
+  controller in dual mode (`CONFIG_BTDM_CTRL_MODE_BTDM=y`) rather than BLE-only,
+  so it is the larger variant even though NimBLE releases the Classic BT static
+  memory at init.
+
+### The ordering trap, and why the socket goes first
+
+0.30.6 also reordered the relay to ask for the radio *before* opening the TLS
+socket, reasoning that the BT controller is the one allocation here that can
+neither shrink nor be retried, so it should get first refusal. **That was
+wrong, and the field disproved it in a single cycle.** The radio started and
+the handshake underneath it did not:
+
+```
+TLS connect to the backend failed        1.28 s from claimed_at to completed_at
+```
+
+against a 15-second connect timeout. An allocation had failed before anything
+touched the network — and the same cycle went on to complete a TLS handshake to
+the same host, to report that very failure, once the radio had been released.
+
+The mis-ranking was about *which* constraint binds. The controller needs a large
+total in many pieces. mbedtls needs **contiguity**, and a lot of it: this
+framework ships `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384` with
+`CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN` unset, so a session wants **two 16 kB
+contiguous record buffers** and neither may be the small one. Contiguity is the
+first thing fragmentation destroys, so whichever of the two runs second,
+mbedtls suffers far worse for it. The 0.30.4 log had already said so: once the
+controller took its share, `largest` collapsed to 13812 — under one record
+buffer.
+
+So the fragile allocation goes first, the robust one takes what is left, and
+the ring — the only one of the three that can shrink and still produce a
+recording — goes last. Getting all three to fit is a matter of lowering the
+peak, not of reordering it. **Do not re-reorder this without a field log
+showing the handshake surviving underneath a live controller.**
+
+That log is now possible: 0.30.7 prints
+
+```
+[HEAP] audio-radio-up: free=… largest=… min_ever=…
+```
+
+with both the TLS session and the controller resident, and puts the free and
+largest-block figures on the `TLS connect to the backend failed` line too. The
+0.30.6 failure had to be diagnosed from `device_commands` timestamps in the
+backend, because neither number was printed anywhere.
+
+If you need to diagnose one of these without a serial cable, that query is
+worth keeping:
+
+```sql
+SELECT id, claimed_at, completed_at,
+       completed_at - claimed_at AS relay_duration,
+       result->>'message' AS message
+FROM device_commands
+WHERE command_type = 'record_audio'
+ORDER BY id DESC LIMIT 5;
+```
+
+A sub-second duration on a connect failure means an allocation that never
+reached the network. Something near the 15-second timeout means a link or a
+handshake problem instead. The two want completely different fixes.
+
+### A failed BLE init no longer strands its memory
+
+`NimBLEDevice::init()` brings the IDF controller up before it reaches the host,
+so a failure at the host layer returned false with the controller still holding
+its allocation — and nothing unwound it, because `NimBLEDevice::deinit()` guards
+on a flag the failed init never set. In the 0.30.4 log that cost ~20 kB for the
+rest of the cycle (91 kB at `audio-start`, 71 kB at `cycle-end` with everything
+torn down), and the minimum free heap for the cycle was **1456 bytes** — the
+command-result POST and the OTA check that follow each open a fresh TLS session
+on that. The failed recording was the harmless half of it. Since 0.30.6
+`blestack::acquire()` unwinds the controller by hand when init fails.
+
 ## When a recording comes back with seams
 
 A hub on 0.30.1 recorded 27.3 s of a 30 s request with `Dropped: 0 B` and
@@ -337,9 +483,13 @@ Two things on the hub can do that, and 0.30.2 addresses both:
   NimBLE host task shares core 0 with the WiFi driver, which is busy precisely
   because the same session is uploading over TLS. Whenever the host task was
   held off longer than that, the pool emptied and the controller dropped the
-  next packet before any HiveHub code saw it. `platformio.ini` now asks for 48
-  blocks (~370 ms) on `esp32dev`. The C6 already gets 24 from the IDF and is
-  single-core, so its host task is not competing the same way.
+  next packet before any HiveHub code saw it. `platformio.ini` raised this to 48
+  blocks (~370 ms) on `esp32dev` in 0.30.2, and **0.30.7 lowered it again to 24
+  (~185 ms)** to buy back ~6 kB for the memory problem above — seams beat no
+  recording. 24 is still twice NimBLE's own default, and the other two causes of
+  the 0.30.2 seams (below) were fixed in code, not by buffering. The C6 gets 24
+  from the IDF and is single-core, so its host task is not competing the same
+  way.
 * **Each HTTP chunk cost three TLS records.** Every `NetworkClientSecure::write()`
   is one `mbedtls_ssl_write()`, so writing the hex length line, the payload and
   the trailing CRLF separately spent three records — three lots of framing and
@@ -363,11 +513,13 @@ one-second ring; it is a cheap `logDiag()` now.
 | "HiveInside not found in scan" | Out of range, flat battery, or busy with an OTA |
 | Stuck at "Waiting for the hub to wake" | Normal for up to one reporting interval; longer means the hub is offline |
 | A recording stays at "requested" forever | The command never reached the queue. Check the server log for `could not queue record_audio`; the row is marked failed with the reason from 0.30.0 on |
-| A recording sits at "streaming" | Neither the command result nor `/finalize` arrived — a reset mid-session, or a hub that went offline before its next wake. The audio is on disk and plays anyway; after five minutes the row resolves to ready with `confirmation: unknown`. `SELECT result->>'message' FROM device_commands WHERE command_type = 'record_audio' ORDER BY id DESC LIMIT 1;` is the hub's own account of what happened |
+| A recording sits at "streaming" | Neither the command result nor `/finalize` arrived — a reset mid-session, or a hub that went offline before its next wake. The audio is on disk and plays anyway; five minutes after the upload started (not after the request was queued) the row resolves to ready with `confirmation: unknown`. `SELECT result->>'message' FROM device_commands WHERE command_type = 'record_audio' ORDER BY id DESC LIMIT 1;` is the hub's own account of what happened |
 | Audio is loud for a moment then near-silence | The microphone lost power mid-session. On HiveInside before the sensor-rail fix, a measurement cycle already running when the session started would switch LDO1 off underneath it |
 | "node busy" | An OTA or another session holds the node's single connection |
 | Recording marked incomplete | See the quality flags above |
 | Gaps, with `Dropped` at 0 | The link kept up but audio was lost after it left the node. Fixed in 0.30.2 — see [When a recording comes back with seams](#when-a-recording-comes-back-with-seams) |
 | "hub reset during relay (panic/exception)" | A crash mid-session. Fixed in hub firmware 0.30.1 — see [When the hub resets mid-recording](#when-the-hub-resets-mid-recording) |
-| "BLE stack would not start" | The hub could not bring the radio up with WiFi and TLS already open. Almost always a 30-pin ESP32 with an unusually full heap; the serial log prints the free heap and the largest free block next to it |
+| "BLE stack would not start" | The hub could not bring the radio up at all. Almost always a 30-pin ESP32 with an unusually full heap; the serial log prints the free heap and the largest free block next to it. Hub firmware 0.30.7 makes this much less likely — see [Why this is a 30-pin ESP32 problem](#why-this-is-a-30-pin-esp32-problem) |
+| "TLS connect to the backend failed" | The hub could not open the upload socket. Since 0.30.7 the serial log prints free heap and largest block beside it; a sub-second `relay_duration` in `device_commands` means an allocation failure rather than a network one. This was the 0.30.6 symptom of asking for the radio before the socket |
+| "the hub started uploading but no audio arrived" | The hub opened the upload and closed it before sending audio — almost always because the BLE session failed to start straight after the socket opened (Traefik logs this as a `499` a few hundred ms in) — and then its command result did not arrive either. From hub firmware 0.30.8 on the hub retries that result and, failing that, holds it in RTC memory and delivers it on its next cycle; the server then replaces this message with the hub's real reason, which carries `[heap free …, largest …, min …]` for any start failure. Before 0.30.8 the backend also logged a `ClientDisconnect` traceback here; that is now a one-line warning |
 | "audio buffer trimmed to N B" (serial log, not an error) | The hub could not get the full 32 KiB staging buffer and took a smaller one. The recording still happens; a slow upload will show up as gaps sooner |

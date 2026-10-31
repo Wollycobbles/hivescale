@@ -12,6 +12,7 @@
 
 #include "audio_ring.h"
 #include "ble_stack.h"
+#include "heap_diag.h"
 #include "hivehub_network.h"  // crc32Update
 
 #if ENABLE_BLE_SCAN
@@ -28,7 +29,8 @@ String uuid(const char* prefix) { return String(prefix) + BASE; }
 constexpr uint8_t OP_START = 0x01;
 constexpr uint8_t OP_STOP = 0x02;
 
-// DATA framing: seq(2 LE) flags(1) reserved(1), then PCM16 LE.
+// DATA framing: seq(2 LE) flags(1) gain_db(1), then PCM16 LE. gain_db is the
+// gain the node applied (HiveInside 0.8.0+); older nodes send 0 there.
 constexpr size_t HEADER_LEN = 4;
 constexpr uint8_t FLAG_FINAL = 0x01;  // last packet of the session
 constexpr uint8_t FLAG_GAP = 0x02;    // node dropped audio just before this one
@@ -72,6 +74,7 @@ portMUX_TYPE s_ringMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool s_streaming = false;
 volatile bool s_sawFinal = false;
 uint32_t s_gaps = 0;
+hiaudio::HeaderGain s_hdrGain;
 bool s_haveSeq = false;
 uint16_t s_nextSeq = 0;
 uint32_t s_crc = 0;
@@ -96,6 +99,9 @@ void onNotify(NimBLERemoteCharacteristic* /*chr*/, uint8_t* data, size_t len,
   if (flags & FLAG_GAP) s_gaps++;
   s_nextSeq = seq + 1;
   s_haveSeq = true;
+  // The applied gain. A compare and a store — never a log line here, for the
+  // same reason as the ring write below.
+  s_hdrGain.observe(data[3]);
 
   // One bounded memcpy (two at the wrap), not a byte loop with a modulo per
   // byte: this runs with interrupts disabled on the core the BLE controller
@@ -119,6 +125,7 @@ void resetSession() {
   s_streaming = false;
   s_sawFinal = false;
   s_gaps = 0;
+  s_hdrGain.reset();
   s_haveSeq = false;
   s_nextSeq = 0;
   portEXIT_CRITICAL(&s_ringMux);
@@ -234,13 +241,15 @@ bool begin(const String& mac, uint16_t durationDs, int8_t gainDb) {
     return false;
   }
 
-  // Bring BLE up BEFORE the ring, not after. Both want memory from a heap that
-  // already holds WiFi and an open TLS session, and on the classic ESP32 there
-  // is far less of it than on the C6 — the BT controller alone wants tens of
-  // kilobytes. Of the two, the ring is the one that can be made smaller and
-  // still produce a recording, so it gets what is left rather than first
-  // refusal. Ordered the other way, a hub that could have recorded with a
-  // half-size buffer instead failed to start the radio at all.
+  // Bring BLE up here, with the caller's TLS session already open, and NOT
+  // ahead of it. 0.30.6 hoisted this above the socket on the theory that the
+  // controller is the least flexible allocation and should bid first; the
+  // field answered in one cycle with "TLS connect to the backend failed" 1.28 s
+  // after the command was claimed, against a 15 s connect timeout — mbedtls
+  // failing to allocate, before it reached the network. See the long note in
+  // hivehub_network.cpp: mbedtls needs two 16 kB CONTIGUOUS record buffers on
+  // this framework, and contiguity is what a resident BT controller destroys.
+  // The fragile allocation goes first; this one is the robust one.
   if (!blestack::acquire()) {
     s_lastError = "BLE stack would not start (out of memory with WiFi and TLS up?)";
     Serial.printf("[HI-AUD] %s (free heap %u, largest block %u)\n",
@@ -250,12 +259,22 @@ bool begin(const String& mac, uint16_t durationDs, int8_t gainDb) {
   }
   NimBLEDevice::setMTU(247);  // 240 PCM bytes per notification once granted
 
+  // What the heap looks like with BOTH the TLS session and the controller
+  // resident — the number every question on this path turns out to need, and
+  // the one 0.30.6 had no way to print. logDiag(), not probe(): nothing is
+  // streaming yet, but checkIntegrity() walks every block and this runs inside
+  // the node's ten-second arm window once the connect below happens.
+  heapdiag::logDiag("audio-radio-up");
+
   // Size the ring against what the heap can actually give, not against what the
-  // config asks for. HIVEINSIDE_AUDIO_RING_BYTES is a cushion — how long a TLS
-  // write may stall before audio is lost — so halving it costs gaps under load,
-  // while insisting on the full figure costs the whole recording. Never take
-  // more than half the largest contiguous block: mbedtls still has to allocate
-  // record buffers underneath this for every chunk of the upload.
+  // config asks for. This runs last of the three big allocations on this path —
+  // controller, TLS session, ring — which is the right way round: it is the
+  // only one of them that can shrink and still produce a recording.
+  // HIVEINSIDE_AUDIO_RING_BYTES is a cushion — how long a TLS write may stall
+  // before audio is lost — so halving it costs gaps under load, while insisting
+  // on the full figure costs the whole recording. Never take more than half the
+  // largest contiguous block: mbedtls still has to allocate record buffers
+  // underneath this for every chunk of the upload.
   size_t want = HIVEINSIDE_AUDIO_RING_BYTES;
   const size_t largest = ESP.getMaxAllocHeap();
   while (want > HIVEINSIDE_AUDIO_RING_MIN_BYTES && want > largest / 2) {
@@ -383,8 +402,11 @@ bool begin(const String& mac, uint16_t durationDs, int8_t gainDb) {
   // would be destroyed before printf read the pointer.
   String durationLabel = durationDs ? (String(durationDs / 10.0f, 1) + "s")
                                     : String("open-ended");
-  Serial.printf("[HI-AUD] session started: %s, %s, gain %+d dB, MTU %u\n",
-                m.c_str(), durationLabel.c_str(), (int)gainDb,
+  char gainLabel[12];
+  if (gainDb == hiaudio::GAIN_AUTO) snprintf(gainLabel, sizeof(gainLabel), "auto");
+  else snprintf(gainLabel, sizeof(gainLabel), "%+d dB", (int)gainDb);
+  Serial.printf("[HI-AUD] session started: %s, %s, gain %s, MTU %u\n",
+                m.c_str(), durationLabel.c_str(), gainLabel,
                 (unsigned)s_client->getMTU());
   return true;
 }
@@ -419,8 +441,21 @@ bool finish(Stats* out) {
   stats.ringOverruns = s_ring.dropEvents();
   stats.ringDroppedBytes = s_ring.dropped();
   stats.gaps = s_gaps;
+  stats.headerGain = s_hdrGain;
   portEXIT_CRITICAL(&s_ringMux);
   stats.crc32 = s_crc;
+
+  // Logged whatever the node's version: on one older than HiveInside 0.8.0 the
+  // byte is always 0, and the caller decides whether to believe it.
+  if (stats.headerGain.seen) {
+    Serial.printf("[HI-AUD] node applied gain %+d dB\n",
+                  (int)stats.headerGain.gainDb);
+    if (stats.headerGain.changes) {
+      Serial.printf("[HI-AUD] WARNING: the applied gain changed in %u packet(s) "
+                    "of one clip; not reporting it\n",
+                    (unsigned)stats.headerGain.changes);
+    }
+  }
 
   uint8_t status[STATUS_LEN];
   bool haveStatus = readStatus(status);

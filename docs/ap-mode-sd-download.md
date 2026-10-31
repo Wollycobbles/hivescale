@@ -35,7 +35,10 @@ The setup button is connected to GPIO27 and should pull the pin to GND when pres
 >
 > * A hub sealed in an enclosure no longer has the setup button brought out. Use
 >   the `start_provisioning` command (dashboard or API) to open the portal
->   remotely instead of opening the box — that is exactly what it is for.
+>   remotely instead of opening the box — that is exactly what it is for. If
+>   you want a physical button anyway, enable the optional
+>   [setup button on D0](inspection-mode.md#external-setup-button-on-d0-optional):
+>   it wakes the hub from deep sleep and opens the AP straight away.
 > * **The USER button cannot wake the C6 from deep sleep, and holding it at
 >   power-up flashes the chip rather than opening the AP.** GPIO9 is not an
 >   LP-IO pad (only GPIO0–GPIO7 are), so it can never be a deep-sleep wake
@@ -296,8 +299,8 @@ See [`api.md`](api.md#post-apiv1appdevicesdevice_idmeasurementsimport) for the
 endpoint contract and the HivePal repository's
 `apps/hivescale/hivescale-integration.md` for the proxy and UI details.
 
-The import is **idempotent**: `(device_id, measured_at)` is treated as the
-natural key, so re-uploading the same file — or a file that overlaps with
+The import is **idempotent**: each line's `measurement_id` is its natural key
+(`(device_id, measured_at)` for old lines without one), so re-uploading the same file — or a file that overlaps with
 readings the device already sent over the network — inserts only the genuinely
 new rows and skips the rest. There is no harm in uploading the full backup every
 time.

@@ -66,6 +66,9 @@ const state = {
   // { publish: bool } — whether ENABLE_PUBLIC_EMBEDS is on, which decides
   // whether the Device & admin page offers the "Publish data" panel at all.
   features: {},
+  // Single sign-on (OIDC, e.g. authentik), from /auth/status:
+  // { enabled, provider_name, password_login, login_url }.
+  sso: { enabled: false, password_login: true },
 };
 
 // ── selection helpers ─────────────────────────────────────────────────────────
@@ -357,6 +360,42 @@ function setStatus(text) {
   ui.status.hidden = false;
 }
 
+// ── daily weight extremes ──────────────────────────────────────────────────────
+// The chart rows of a long range are thinned on the server to ~1500 readings,
+// so a "daily max" computed from them is only the max of what happened to be
+// kept. The server computes the real per-day extremes from every reading; it
+// costs about a second per year of data, so it is fetched only for the Weight
+// view, only for ranges that are actually thinned, and kept for a while —
+// finished days do not change.
+const DAILY_WEIGHT_MIN_DAYS = 30;
+const DAILY_WEIGHT_TTL_MS = 10 * 60 * 1000;
+const dailyWeightCache = new Map(); // `${deviceId}|${range}` -> { at, days, pending }
+
+function dailyWeightFor(deviceId) {
+  const { days } = RANGES[state.range];
+  if (days < DAILY_WEIGHT_MIN_DAYS) return null;
+  const key = `${deviceId}|${state.range}`;
+  const entry = dailyWeightCache.get(key);
+  const fresh = entry && Date.now() - entry.at < DAILY_WEIGHT_TTL_MS;
+  if (!fresh && !entry?.pending) {
+    const pending = { ...(entry || {}), pending: true };
+    dailyWeightCache.set(key, pending);
+    const start = new Date(Date.now() - days * 86400000).toISOString();
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    api.dailyWeight(deviceId, { start, tz })
+      .then((res) => {
+        dailyWeightCache.set(key, { at: Date.now(), days: res.days || [], pending: false });
+        if (state.group === "weight") render();
+      })
+      .catch((err) => {
+        // Keep whatever was there; the view falls back to the chart rows.
+        console.error("HiveHub: daily weight request failed:", err);
+        dailyWeightCache.set(key, { ...(entry || {}), at: Date.now(), pending: false });
+      });
+  }
+  return entry?.days || null;
+}
+
 // ── rendering ─────────────────────────────────────────────────────────────────
 function buildState() {
   const d = state.data || {};
@@ -387,10 +426,13 @@ function buildState() {
     deviceLatest: (id) => (d.latest && d.latest[id]) || state.deviceLatest[id] || null,
     deviceMeasurements: (id) => (d.measurements && d.measurements[id]) || [],
     deviceInspections: (id) => (d.inspections && d.inspections[id]) || [],
+    // Server-side daily weight extremes for long ranges (null = use chart rows).
+    deviceDailyWeight: dailyWeightFor,
     inspections: (d.inspections && d.inspections[activeId]) || [],
     deviceChannels: (id) => (id === activeId && d.deviceId === activeId ? d.channels : null),
     authUser: state.authUser,
     features: state.features,
+    sso: state.sso,
     toast,
     reload: loadData,
     actions: {
@@ -597,7 +639,33 @@ function renderActiveDeviceField() {
   ui.activeDeviceSelect.value = state.activeDeviceId;
 }
 
+// ── unsaved edits ─────────────────────────────────────────────────────────────
+// render() rebuilds the whole content area from the loaded state, so a form
+// someone is filling in (calibration, hive names, an inspection note, a
+// password) is rebuilt from the saved values — and the 60s auto-refresh did
+// that in the middle of typing. The refresh now waits while a form field in
+// the content has focus or holds input that was not yet saved; leaving the
+// view (any render) ends the edit.
+let contentDirty = false;
+const EDIT_FIELDS = "input:not([type=button]):not([type=submit]):not([type=reset]), textarea, select";
+
+function editingInProgress() {
+  if (contentDirty) return true;
+  const a = document.activeElement;
+  return !!(a && ui.content.contains(a) && a.matches(EDIT_FIELDS));
+}
+
+function autoRefresh() {
+  if (document.hidden || state.loading) return;
+  if (editingInProgress()) {
+    setStatus("Auto-refresh paused while you edit — Refresh reloads now");
+    return;
+  }
+  loadData();
+}
+
 function render() {
+  contentDirty = false;
   renderSidebar();
   clearCharts();
   const group = GROUPS.find((g) => g.id === state.group) || GROUPS[0];
@@ -672,7 +740,11 @@ function wireEvents() {
   ui.refreshBtn.addEventListener("click", () => loadData({ full: true }));
   if (ui.logoutBtn) {
     ui.logoutBtn.addEventListener("click", async () => {
-      try { await auth.logout(); } catch (_) { /* ignore — clear locally anyway */ }
+      let r = null;
+      try { r = await auth.logout(); } catch (_) { /* ignore — clear locally anyway */ }
+      // SSO session: continue to the provider's logout, which sends the browser
+      // back to the dashboard afterwards.
+      if (r && r.redirect) { window.location.assign(r.redirect); return; }
       state.authUser = null;
       state.features = {};
       state.data = null;
@@ -694,7 +766,10 @@ function wireEvents() {
   // Canvas charts don't inherit CSS colours, so redraw them when the theme flips.
   window.addEventListener("themechange", () => requestAnimationFrame(drawCharts));
   // auto-refresh every 60s
-  setInterval(() => { if (!document.hidden && !state.loading) loadData(); }, 60000);
+  ui.content.addEventListener("input", (e) => {
+    if (e.target.matches && e.target.matches(EDIT_FIELDS)) contentDirty = true;
+  });
+  setInterval(autoRefresh, 60000);
 }
 
 // ── auth gate (login / first-run setup) ───────────────────────────────────────
@@ -718,14 +793,46 @@ function authField(labelText, input) {
   return el("label", { class: "auth-field" }, el("span", {}, labelText), input);
 }
 
+// Why a single-sign-on attempt failed, keyed by the ?sso_error= code the
+// callback redirects back with (see server/oidc.py).
+function ssoErrorMessage(code) {
+  const name = state.sso.provider_name || "the identity provider";
+  const messages = {
+    unknown_user: `Your ${name} account's email address does not belong to any dashboard user. Ask an administrator to add a user with that email.`,
+    ambiguous: "Several dashboard users share your email address. Ask an administrator to give each account its own address.",
+    email_unverified: `${name} reports your email address as not verified.`,
+    no_email: `${name} did not send an email address. Check that the "email" scope is granted to this application.`,
+    denied: `Sign-in was cancelled or ${name} denied access to this application.`,
+    state: "The sign-in took too long or was started in another browser. Please try again.",
+    disabled: "Single sign-on is not enabled on this server.",
+  };
+  return messages[code] || `Sign-in with ${name} failed. Please try again or contact an administrator.`;
+}
+
+function ssoButton() {
+  return el("a", { class: "btn sso-btn", href: state.sso.login_url },
+    `Sign in with ${state.sso.provider_name}`);
+}
+
 function renderLogin(opts = {}) {
+  const errLine = el("p", { class: "auth-error" }, opts.message || "");
+  const sso = state.sso.enabled;
+  if (!state.sso.password_login) {
+    // SSO only: no password form at all.
+    showAuthScreen(el("div", { class: "auth-card" },
+      el("h1", {}, "HiveHub Dashboard"),
+      el("p", { class: "auth-sub" }, "Sign in to view and manage your hives."),
+      errLine,
+      ssoButton()));
+    return;
+  }
   const u = el("input", { type: "text", autocomplete: "username", required: true });
   const p = el("input", { type: "password", autocomplete: "current-password", required: true });
-  const btn = el("button", { class: "btn", type: "submit" }, "Sign in");
-  const errLine = el("p", { class: "auth-error" }, opts.message || "");
+  const btn = el("button", { class: sso ? "btn ghost" : "btn", type: "submit" }, "Sign in");
   const form = el("form", { class: "auth-card" },
     el("h1", {}, "HiveHub Dashboard"),
     el("p", { class: "auth-sub" }, "Sign in to view and manage your hives."),
+    ...(sso ? [ssoButton(), el("p", { class: "auth-divider" }, "or with a password")] : []),
     authField("Username", u),
     authField("Password", p),
     errLine,
@@ -735,7 +842,7 @@ function renderLogin(opts = {}) {
     btn.disabled = true; errLine.textContent = "";
     try {
       const r = await auth.login(u.value, p.value);
-      state.authUser = r.user;
+      state.authUser = { ...r.user, auth: "password" };
       state.features = r.features || {};
       await startApp();
     } catch (err) {
@@ -744,10 +851,11 @@ function renderLogin(opts = {}) {
     }
   });
   showAuthScreen(form);
-  u.focus();
+  if (!sso) u.focus();
 }
 
 function renderSetup() {
+  if (!state.sso.password_login) { renderSsoSetup(); return; }
   const u = el("input", { type: "text", autocomplete: "username", required: true });
   const em = el("input", { type: "email", autocomplete: "email", placeholder: "you@example.com" });
   const p = el("input", { type: "password", autocomplete: "new-password", required: true });
@@ -771,9 +879,41 @@ function renderSetup() {
     btn.disabled = true; errLine.textContent = "";
     try {
       const r = await auth.setup(u.value, p.value, em.value);
-      state.authUser = r.user;
+      state.authUser = { ...r.user, auth: "password" };
       state.features = r.features || {};
       await startApp();
+    } catch (err) {
+      errLine.textContent = err.message || "Setup failed";
+      btn.disabled = false;
+    }
+  });
+  showAuthScreen(form);
+  u.focus();
+}
+
+// First run with password login disabled: the admin account is created without
+// a password, then claimed by signing in through the SSO provider with the same
+// email address.
+function renderSsoSetup() {
+  const name = state.sso.provider_name;
+  const u = el("input", { type: "text", autocomplete: "username", required: true });
+  const em = el("input", { type: "email", autocomplete: "email", required: true, placeholder: "you@example.com" });
+  const btn = el("button", { class: "btn", type: "submit" }, `Create admin and sign in with ${name}`);
+  const errLine = el("p", { class: "auth-error" });
+  const form = el("form", { class: "auth-card" },
+    el("h1", {}, "Welcome to HiveHub"),
+    el("p", { class: "auth-sub" },
+      `Create the first administrator. You then sign in with ${name}, which must report exactly this email address.`),
+    authField("Username", u),
+    authField(`Email (your ${name} address)`, em),
+    errLine,
+    el("div", { class: "form-actions" }, btn));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    btn.disabled = true; errLine.textContent = "";
+    try {
+      await auth.setup(u.value, null, em.value);
+      window.location.assign(state.sso.login_url);
     } catch (err) {
       errLine.textContent = err.message || "Setup failed";
       btn.disabled = false;
@@ -829,8 +969,18 @@ async function init() {
         : "Could not reach the HiveHub API: " + err.message));
     return;
   }
+  if (status.sso) state.sso = status.sso;
+  // Back from a failed SSO attempt: show why, and drop the code from the URL so
+  // a reload does not show it again.
+  const params = new URLSearchParams(window.location.search);
+  const ssoError = params.get("sso_error");
+  if (ssoError) {
+    params.delete("sso_error");
+    const qs = params.toString();
+    window.history.replaceState(null, "", window.location.pathname + (qs ? "?" + qs : "") + window.location.hash);
+  }
   if (status.setup_required) { renderSetup(); return; }
-  if (!status.authenticated) { renderLogin(); return; }
+  if (!status.authenticated) { renderLogin(ssoError ? { message: ssoErrorMessage(ssoError) } : {}); return; }
   state.authUser = status.user;
   state.features = status.features || {};
   await startApp(status.devices);

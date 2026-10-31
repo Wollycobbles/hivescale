@@ -2,7 +2,7 @@
 
 > **Project renamed: HiveScale → HiveHub.** The project outgrew its original
 > "dual scale" scope and now acts as a **data collector / hub for many different
-> types of beehive sensors and scales** (up to 16 hives per ESP32), so the name
+> types of beehive sensors and scales** (up to 18 hives per ESP32), so the name
 > was changed to match. A few internal identifiers — the database measurement
 > columns, the OTA `target` value, the Docker image name (`…/hivescale-api`), the
 > device's stored-config (NVS) namespace and MQTT topics — still use the old
@@ -15,7 +15,7 @@
 
 **HiveHub is an ESP32-based data collector for beehive sensors and scales.** It
 gathers weight, temperature, humidity, sound, vibration, power state, and network
-state from one or more hives (up to 16 per ESP32) and sends the readings to a
+state from one or more hives (up to 18 per ESP32) and sends the readings to a
 self-hosted FastAPI backend backed by PostgreSQL, where they can be displayed in
 [HivePal](https://github.com/martinhrvn/hive-pal).
 
@@ -374,12 +374,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `FIRMWARE_DIR` | Optional | Firmware binary directory, default `/app/firmware` |
 | `DB_POOL_MIN_SIZE` / `DB_POOL_MAX_SIZE` | Optional | DB connection pool bounds (default `1` / `10`) |
 | `RATE_LIMIT_ENABLED` / `RATE_LIMIT_DEFAULT` | Optional | Per-client-IP rate limit (default on, `120/minute`) |
-| `MAX_BODY_BYTES` / `MAX_FIRMWARE_BYTES` | Optional | Request-body and firmware-upload size caps (default 256 KiB / 16 MiB) |
+| `MAX_BODY_BYTES` / `MAX_FIRMWARE_BYTES` / `HIVEHUB_SD_IMPORT_MAX_FILE_SIZE` | Optional | Request-body, firmware-upload and SD-import size caps (default 256 KiB / 16 MiB / 250 MiB). Upload routes authenticate before reading their body. |
 | `ENABLE_LOCAL_DASHBOARD` | Optional | Serve the built-in **login-protected** dashboard at `/dashboard` and its `/api/v1/local/*` API (default off). It serves every device on the server behind one login, so keep it off on multi-tenant deployments. |
 | `DASHBOARD_SESSION_SECRET` / `DASHBOARD_SESSION_TTL_HOURS` / `DASHBOARD_COOKIE_SECURE` | Optional | Dashboard login-session settings: signing secret (auto-generated and persisted when blank), session lifetime (default `168` h), HTTPS-only cookie flag |
 | `ENABLE_PUBLIC_EMBEDS` | Optional | Allow the dashboard's **Device & admin → Publish data** panel to serve individual published charts without a login, for embedding in a website (default on; nothing is public until an admin publishes it, and the panel is hidden when this is off). See [Publish data](docs/publish-embed.md). |
 | `TRUST_PROXY_HEADERS` | Optional | Trust `CF-Connecting-IP` / `X-Forwarded-For` for rate-limit client IPs (default `false`; set `true` only behind a reverse proxy that overwrites these headers, otherwise a direct client can spoof them to dodge the limiter) |
 | `INSIGHTS_RECONCILE_*` | Optional | Background insight-history reconciliation (see `server/.env.example`) |
+| `INSIGHTS_TIMEZONE` / `INSIGHTS_HEMISPHERE` | Optional | The apiary's IANA time zone (default: a device's night-mode zone, else the container's `TZ`, else UTC) and hemisphere (`north` / `south`) for the insight rules' time-of-day and season windows |
 | `SMTP_*` / `NOTIFY_MIN_SEVERITY` | Optional | E-mail channel for insight alert notifications (off by default — see [Insight alert notifications](docs/notifications.md)) |
 | `WEB_PUSH_ENABLED` / `VAPID_*` | Optional | Web Push channel for insight alert notifications (off by default — see [Insight alert notifications](docs/notifications.md)) |
 | `MQTT_*` | Optional | MQTT bridge to Home Assistant / Node-RED / openHAB (off by default — see [MQTT / Home Assistant integration](#mqtt--home-assistant-integration)) |
@@ -494,7 +495,9 @@ Enabled only when `ENABLE_LOCAL_DASHBOARD=true`; every route returns `404` when
 disabled. Access is gated by **username + password login** (HttpOnly session
 cookie): the first visit runs a setup wizard that creates the initial admin
 account, read endpoints need any valid session, and write/control endpoints
-need the `admin` role. The API is **not scoped per user** — one login covers
+need the `admin` role. Every request re-checks the session against the live
+account, so deleting an account or changing its password signs out the
+sessions issued before. The API is **not scoped per user** — one login covers
 every device on the server — so keep it off on multi-tenant deployments. These
 endpoints power the built-in `/dashboard` UI; see
 [server/dashboard/README.md](server/dashboard/README.md).
@@ -507,6 +510,7 @@ endpoints power the built-in `/dashboard` UI; see
 | `GET` | `/api/v1/local/devices` | List all devices + hive display names |
 | `PATCH` | `/api/v1/local/devices/{id}/visibility` | Hide / show a device in the hive picker (admin) |
 | `GET` | `/api/v1/local/devices/{id}/measurements[/latest]` | Measurements (date filter, down-sampled for charts) / latest |
+| `GET` | `/api/v1/local/devices/{id}/measurements/daily-weight` | Highest/lowest weight per hive and local day from every reading (`?start_at=`, `?tz=`; backs the Daily max chart for long ranges) |
 | `GET` | `/api/v1/local/export/measurements` · `/summary` | Download readings as an `.ndjson` backup (`?device_id=`, `?hive=`, date filter, admin) / what the download would contain |
 | `POST` | `/api/v1/local/devices/{id}/measurements/import` | Import an SD-card backup or a downloaded one (`.ndjson` / `.tar`, admin; `route_by_device=true` restores a multi-device backup) |
 | `POST` | `/api/v1/local/devices/{id}/measurements/delete` | Delete readings in a time range (admin + device claim code) |

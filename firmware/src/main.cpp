@@ -42,52 +42,61 @@ void runUploadCycle() {
   heapdiag::probe("after-network");
   pollSetupButton();
 
-  JsonDocument doc;
-  // Assembly runs the BLE scan, which inits and deinits the NimBLE stack. That
-  // teardown is deliberately incomplete (deinit(false) — deinit(true) panics on
-  // the C6 once a scan has run this boot, see ble_sensor.cpp), so it is the
-  // stage most worth watching.
-  buildMeasurementDoc(doc);
-  heapdiag::probe("after-measure");
-  pollSetupButton();
+  // The measurement document and its serialised form are scoped to this block
+  // so they are freed BEFORE checkCommands(). They used to live to the end of
+  // the function, which kept them resident through the audio relay — the
+  // tightest moment for heap in the whole firmware on the 30-pin ESP32, where
+  // the staging ring was refused with under 10 kB left and every kilobyte (and
+  // every hole these leave in the heap) counts.
+  {
+    JsonDocument doc;
+    // Assembly runs the BLE scan, which inits and deinits the NimBLE stack. That
+    // teardown is deliberately incomplete (deinit(false) — deinit(true) panics on
+    // the C6 once a scan has run this boot, see ble_sensor.cpp), so it is the
+    // stage most worth watching.
+    buildMeasurementDoc(doc);
+    heapdiag::probe("after-measure");
+    pollSetupButton();
 
-  // SD.begin() is the reproducible boundary after which ESP32-C6 I2C-NG may
-  // reject later transfers. Capture the timestamp before bringing SPI/SD up.
-  initSdCard();
-  heapdiag::probe("after-sd");
+    // SD.begin() is the reproducible boundary after which ESP32-C6 I2C-NG may
+    // reject later transfers. Capture the timestamp before bringing SPI/SD up.
+    initSdCard();
+    heapdiag::probe("after-sd");
 
-  // Stamp sd_ok only now. sdOk is a plain global that starts false on every boot
-  // and prepareSdForSleep() clears it before each deep sleep, so it is always
-  // false while the document above is assembled — stamping it there reported an
-  // SD card fault on every cycle even though the card mounted and the backup
-  // line was written moments later.
-  doc["sd_ok"] = sdOk;
+    // Stamp sd_ok only now. sdOk is a plain global that starts false on every boot
+    // and prepareSdForSleep() clears it before each deep sleep, so it is always
+    // false while the document above is assembled — stamping it there reported an
+    // SD card fault on every cycle even though the card mounted and the backup
+    // line was written moments later.
+    doc["sd_ok"] = sdOk;
 
-  String json = finalizeMeasurementJson(doc);
+    String json = finalizeMeasurementJson(doc);
 
-  if (sdOk) appendBackupLine(json);
+    if (sdOk) appendBackupLine(json);
 
-  // Track the claim in both directions: latch it once the server confirms the
-  // device is claimed, and un-latch it when the server explicitly says it is
-  // not. The second half is what makes "remove the device in the app" a
-  // recoverable action — the device notices the pairing is gone and starts
-  // offering its claim code again, so it can simply be re-claimed. A server
-  // that reports nothing (older build, or a failed upload) changes neither.
-  ClaimStatus claimStatus = ClaimStatus::Unknown;
-  bool currentUploaded = uploadLine(json, &claimStatus);
-  if (claimStatus == ClaimStatus::Claimed) markClaimRegistered();
-  else if (claimStatus == ClaimStatus::Unclaimed) clearClaimRegistered();
+    // Track the claim in both directions: latch it once the server confirms the
+    // device is claimed, and un-latch it when the server explicitly says it is
+    // not. The second half is what makes "remove the device in the app" a
+    // recoverable action — the device notices the pairing is gone and starts
+    // offering its claim code again, so it can simply be re-claimed. A server
+    // that reports nothing (older build, or a failed upload) changes neither.
+    ClaimStatus claimStatus = ClaimStatus::Unknown;
+    bool currentUploaded = uploadLine(json, &claimStatus);
+    if (claimStatus == ClaimStatus::Claimed) markClaimRegistered();
+    else if (claimStatus == ClaimStatus::Unclaimed) clearClaimRegistered();
 
-  if (!currentUploaded) {
-    if (sdOk) {
-      Serial.println("[CYCLE] Live upload failed; adding measurement to retry cache");
-      appendCacheLine(json);
-    } else {
-      Serial.println("[CYCLE] Live upload failed and no SD card is available; measurement not cached");
+    if (!currentUploaded) {
+      if (sdOk) {
+        Serial.println("[CYCLE] Live upload failed; adding measurement to retry cache");
+        appendCacheLine(json);
+      } else {
+        Serial.println("[CYCLE] Live upload failed and no SD card is available; measurement not cached");
+      }
+    } else if (sdOk) {
+      uploadCachedLines();
     }
-  } else if (sdOk) {
-    uploadCachedLines();
-  }
+
+  }  // doc and json are released here, before any command runs.
 
   if (scaleCalibrationReportPending()) reportScaleCalibration();
 
@@ -145,6 +154,9 @@ void setup() {
   releaseSleepPinHolds();
   configureC6Antenna();
   pinMode(SETUP_BUTTON_PIN, INPUT_PULLUP);
+#if HAS_EXTERNAL_SETUP_BUTTON
+  pinMode(EXTERNAL_SETUP_BUTTON_PIN, INPUT_PULLUP);
+#endif
 #ifdef CONFIG_IDF_TARGET_ESP32C6
   // Fallback for the case where the status register comes back empty on a wake
   // we know was a GPIO wake: read the pins instead. A firm press is often still
@@ -158,22 +170,30 @@ void setup() {
     const uint64_t reportedMask = gpioWakeMask;
     const bool setupPinIsDown = digitalRead(SETUP_BUTTON_PIN) == LOW;
     if (setupPinIsDown) gpioWakeMask |= 1ULL << SETUP_BUTTON_PIN;
+#if HAS_EXTERNAL_SETUP_BUTTON
+    const bool extSetupPinIsDown = digitalRead(EXTERNAL_SETUP_BUTTON_PIN) == LOW;
+    if (extSetupPinIsDown) gpioWakeMask |= 1ULL << EXTERNAL_SETUP_BUTTON_PIN;
+#else
+    const bool extSetupPinIsDown = false;
+#endif
 #if HAS_INSPECTION_BUTTON
     const bool inspectionPinIsDown = digitalRead(INSPECTION_BUTTON_PIN) == LOW;
     if (inspectionPinIsDown) gpioWakeMask |= 1ULL << INSPECTION_BUTTON_PIN;
 
     // A quick tap can be over before setup() runs.  If the C6 also supplied an
-    // empty wake-status register, neither live pin can identify it.  Only these
-    // two GPIOs are enabled as wake sources; prefer the weatherproof external
+    // empty wake-status register, no live pin can identify it.  Only the
+    // buttons are enabled as wake sources; prefer the weatherproof external
     // inspection button in that ambiguous case.  Opening inspection mode is
-    // safe and reversible, while treating it as the on-board setup button would
-    // strand the hub in its provisioning portal.
-    if (gpioWakeMask == 0 && !setupPinIsDown && !inspectionPinIsDown) {
+    // safe and reversible, while treating it as a setup button would strand
+    // the hub in its provisioning portal.
+    if (gpioWakeMask == 0 && !setupPinIsDown && !extSetupPinIsDown &&
+        !inspectionPinIsDown) {
       gpioWakeMask = 1ULL << INSPECTION_BUTTON_PIN;
       Serial.println(
           "[SETUP] Empty GPIO wake status after button release; assuming inspection button");
     }
 #endif
+    (void)extSetupPinIsDown;
     if (gpioWakeMask != reportedMask) {
       Serial.printf("[SETUP] GPIO wake status 0x%llX; augmented mask 0x%llX from pin levels\n",
                     (unsigned long long)reportedMask,
@@ -209,13 +229,17 @@ void setup() {
   // must be reflected in the cycle it woke, not one cycle later.
   inspection::begin(wakeReason, gpioWakeMask);
 
-  // Setup button — provisioning AP / factory reset. On the C6 both buttons wake
+  // Setup button — provisioning AP / factory reset. On the C6 all buttons wake
   // through the same GPIO cause, so the mask decides; a wake on the inspection
   // button must NOT open the portal, or every inspection would strand the hub
   // in AP mode for the portal timeout.
   const bool setupWake =
 #ifdef CONFIG_IDF_TARGET_ESP32C6
-      (gpioWakeMask & (1ULL << SETUP_BUTTON_PIN)) != 0;
+      (gpioWakeMask & (1ULL << SETUP_BUTTON_PIN)) != 0
+#if HAS_EXTERNAL_SETUP_BUTTON
+      || (gpioWakeMask & (1ULL << EXTERNAL_SETUP_BUTTON_PIN)) != 0
+#endif
+      ;
 #else
       (wakeReason & BIT(ESP_SLEEP_WAKEUP_EXT0)) != 0;
 #endif
@@ -227,7 +251,11 @@ void setup() {
   // ahead of the first measurement cycle, where the discovery scan owns the
   // NimBLE port lifetime.
   const bool portalBoot = consumePortalBootRequest();
-  const bool setupPinDown = digitalRead(SETUP_BUTTON_PIN) == LOW;
+  const bool setupPinDown = digitalRead(SETUP_BUTTON_PIN) == LOW
+#if HAS_EXTERNAL_SETUP_BUTTON
+      || digitalRead(EXTERNAL_SETUP_BUTTON_PIN) == LOW
+#endif
+      ;
 
   if (portalBoot || setupPinDown || setupWake) {
     Serial.println(portalBoot

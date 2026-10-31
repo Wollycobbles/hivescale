@@ -27,11 +27,13 @@ docs/audio-recording.md.
 """
 
 import struct
+import zlib
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from auth import require_api_key, require_device_key
 from commands import create_command
@@ -53,6 +55,17 @@ CHANNELS = 1
 # command that cannot be honoured.
 MAX_DURATION_S = 60
 
+# Recording gain, in dB, as the request carries it end to end (API -> row ->
+# command payload -> the START byte the hub writes). HiveInside 0.8.0 can choose
+# the gain itself: GAIN_AUTO asks it to, and it then picks ONE gain for the whole
+# clip from its first half second (issue HiveInside#78). A sentinel rather than a
+# separate field, because every hub already passes `gain_db` through to the node
+# unchanged, so auto works on them the moment the backend queues it. A node older
+# than 0.8.0 reads 127 as "+127 dB" and clamps it to +20 — louder, never broken.
+GAIN_AUTO = 127
+GAIN_MIN_DB = -20
+GAIN_MAX_DB = 40   # HiveInside 0.8.0+; older nodes clamp to +20 themselves
+
 # How much of a live recording the player may fetch in one poll. Large enough
 # that a 250 ms poll never falls behind 32 kB/s, small enough to stay a normal
 # JSON-sized response.
@@ -72,8 +85,25 @@ MAX_PCM_SLICE = 256 * 1024
 # is legitimately long. "streaming" waits only for a session that the node caps
 # at 60 s plus its upload, so several minutes of silence there means the hub is
 # gone, not slow.
+#
+# The streaming window is measured from started_at — when the upload actually
+# began — never from requested_at. A request can legitimately wait most of the
+# 45 minutes for the hub to wake, and measuring from the request failed a
+# session the moment it started: `bytes` is only written once the body ends,
+# so a live upload looked like "streaming, no audio, 5 minutes old" to the very
+# first sweep, which the live player's own polling triggers.
 RECORDING_REQUESTED_TIMEOUT_MIN = 45
 RECORDING_STREAMING_TIMEOUT_MIN = 5
+
+# What expire_stale_recordings() writes when the hub never reported. These are
+# guesses, and both the hub's late command result and a late /finalize replace
+# them when they turn up — a hub that could not post its result straight after
+# a session holds it and delivers it on its next cycle.
+SWEEP_NO_AUDIO_MSG = "the hub started uploading but no audio arrived"
+SWEEP_NEVER_PICKED_UP_MSG = ("the hub never picked this request up \u2014 offline, "
+                             "or the command was dropped")
+SWEEP_NO_REPORT_MSG = "the hub did not send its report for this session"
+SWEEP_MESSAGES = (SWEEP_NO_AUDIO_MSG, SWEEP_NEVER_PICKED_UP_MSG, SWEEP_NO_REPORT_MSG)
 
 
 def _path_for(device_id: str, recording_id: int) -> Path:
@@ -97,9 +127,12 @@ def _row_to_dict(r) -> dict:
     has — can I trust what I am about to hear? Three states, because there are
     genuinely three:
 
-      "verified"  the hub sent its detailed report and the checksum matched
-      "reported"  the detailed report arrived but the checksum did not match,
-                  or the hub sent no checksum at all
+      "verified"  the hub sent its detailed report, the node's and hub's
+                  checksums matched, AND the bytes on disk match what the hub
+                  says it uploaded — the server's own CRC and length
+      "reported"  the detailed report arrived but something did not match,
+                  or a checksum is missing (an older hub, or a recording
+                  stored before the server computed its own)
       "confirmed" the hub reported the session succeeded, but the detailed
                   report never arrived, so nothing verified the bytes
       "unknown"   nothing came back at all; the audio is whatever landed
@@ -110,12 +143,29 @@ def _row_to_dict(r) -> dict:
     (rec_id, device_id, hive_index, status, requested_at, started_at,
      completed_at, duration_ds, gain_db, sample_rate, num_bytes, crc32,
      device_bytes, device_crc32, dropped_bytes, gaps, ring_overruns,
-     ring_dropped_bytes, clipped_pct, error,
-     requested_by, command_status, command_message) = r
+     ring_dropped_bytes, clipped_pct, applied_gain_db, error,
+     requested_by, server_crc32, hub_bytes, truncated,
+     command_status, command_message) = r
     seconds = (num_bytes or 0) / float(sample_rate * BYTES_PER_SAMPLE) if sample_rate else 0.0
     both_crcs = crc32 is not None and device_crc32 is not None
-    crc_ok = both_crcs and crc32 == device_crc32
     crc_mismatch = both_crcs and crc32 != device_crc32
+    # Did the server keep what the hub sent? `crc32` is the hub's checksum over
+    # what it uploaded; server_crc32 is ours over what reached the disk. A
+    # proxy that cut the body short, or our own size cap, shows up here and
+    # nowhere else — the hub and node agree perfectly about audio we never got.
+    stored_mismatch = bool(
+        truncated
+        or (hub_bytes is not None and (num_bytes or 0) != hub_bytes)
+        or (server_crc32 is not None and crc32 is not None
+            and server_crc32 != crc32)
+    )
+    if stored_mismatch:
+        upload_intact = False
+    elif server_crc32 is not None and crc32 is not None:
+        upload_intact = True
+    else:
+        upload_intact = None  # nothing to compare against
+    crc_ok = both_crcs and not crc_mismatch and upload_intact is True
     if device_bytes is not None:
         confirmation = "verified" if crc_ok else "reported"
     elif command_status == "done":
@@ -128,6 +178,7 @@ def _row_to_dict(r) -> dict:
         status == "ready"
         and confirmation != "unknown"
         and not crc_mismatch
+        and not stored_mismatch
         and not dropped_bytes
         and not gaps
         and not ring_overruns
@@ -142,6 +193,11 @@ def _row_to_dict(r) -> dict:
         "completed_at": completed_at,
         "requested_duration_s": (duration_ds or 0) / 10.0,
         "gain_db": gain_db,
+        # Derived so clients never have to know the sentinel.
+        "gain_mode": "auto" if gain_db == GAIN_AUTO else "manual",
+        # What the node says it applied (HiveInside 0.8.0+, hub 0.33.0+). NULL
+        # when unknown: an older node, an older hub, or no audio arrived.
+        "applied_gain_db": applied_gain_db,
         "sample_rate": sample_rate,
         "bytes": num_bytes,
         "seconds": round(seconds, 2),
@@ -152,6 +208,11 @@ def _row_to_dict(r) -> dict:
         "clipped_pct": clipped_pct,
         "complete": complete,
         "crc_ok": crc_ok,
+        # True: the bytes on disk are exactly what the hub uploaded. False: they
+        # are not (cut short, capped, or altered). None: nothing to compare.
+        "upload_intact": upload_intact,
+        "truncated": bool(truncated),
+        "hub_bytes": hub_bytes,
         "confirmation": confirmation,
         # What the hub itself said about the session. Worth surfacing verbatim:
         # when something goes wrong it is usually more specific than anything
@@ -173,7 +234,8 @@ _SELECT = """
            r.started_at, r.completed_at, r.duration_ds, r.gain_db,
            r.sample_rate, r.bytes, r.crc32, r.device_bytes, r.device_crc32,
            r.dropped_bytes, r.gaps, r.ring_overruns, r.ring_dropped_bytes,
-           r.clipped_pct, r.error, r.requested_by,
+           r.clipped_pct, r.applied_gain_db, r.error, r.requested_by,
+           r.server_crc32, r.hub_bytes, r.truncated,
            c.status, c.result->>'message'
     FROM hive_recordings r
     LEFT JOIN device_commands c ON c.id = r.command_id
@@ -202,39 +264,37 @@ def expire_stale_recordings() -> None:
                 UPDATE hive_recordings
                 SET status = 'ready',
                     completed_at = now(),
-                    error = COALESCE(error,
-                        'the hub did not send its report for this session')
+                    error = COALESCE(error, %s)
                 WHERE status = 'streaming'
                   AND bytes > 0
-                  AND requested_at < now() - (%s || ' minutes')::interval;
+                  AND COALESCE(started_at, requested_at)
+                      < now() - (%s || ' minutes')::interval;
                 """,
-                (RECORDING_STREAMING_TIMEOUT_MIN,),
+                (SWEEP_NO_REPORT_MSG, RECORDING_STREAMING_TIMEOUT_MIN),
             )
             cur.execute(
                 """
                 UPDATE hive_recordings
                 SET status = 'failed',
                     completed_at = now(),
-                    error = COALESCE(error,
-                        'the hub started uploading but no audio arrived')
+                    error = COALESCE(error, %s)
                 WHERE status = 'streaming'
                   AND bytes = 0
-                  AND requested_at < now() - (%s || ' minutes')::interval;
+                  AND COALESCE(started_at, requested_at)
+                      < now() - (%s || ' minutes')::interval;
                 """,
-                (RECORDING_STREAMING_TIMEOUT_MIN,),
+                (SWEEP_NO_AUDIO_MSG, RECORDING_STREAMING_TIMEOUT_MIN),
             )
             cur.execute(
                 """
                 UPDATE hive_recordings
                 SET status = 'failed',
                     completed_at = now(),
-                    error = COALESCE(error,
-                        'the hub never picked this request up \u2014 offline, or the '
-                        'command was dropped')
+                    error = COALESCE(error, %s)
                 WHERE status = 'requested'
                   AND requested_at < now() - (%s || ' minutes')::interval;
                 """,
-                (RECORDING_REQUESTED_TIMEOUT_MIN,),
+                (SWEEP_NEVER_PICKED_UP_MSG, RECORDING_REQUESTED_TIMEOUT_MIN),
             )
             conn.commit()
 
@@ -283,6 +343,46 @@ def finalize_from_command_result(device_id: str, command_id: int,
             if cur.rowcount:
                 logger.info("recording for command %s closed by command result "
                             "(success=%s)", command_id, success)
+            elif not success:
+                # Late: the sweep already failed the row with a guess. The hub's
+                # reason is better than the guess, so it replaces it — but only
+                # a sweep message, never a verdict /finalize wrote.
+                cur.execute(
+                    """
+                    UPDATE hive_recordings
+                    SET error = %s
+                    WHERE command_id = %s AND device_id = %s
+                      AND status = 'failed'
+                      AND error IN (%s, %s);
+                    """,
+                    (failed_msg, command_id, device_id,
+                     SWEEP_NO_AUDIO_MSG, SWEEP_NEVER_PICKED_UP_MSG),
+                )
+                if cur.rowcount:
+                    logger.info("recording for command %s: late command result "
+                                "replaced the stale-sweep message", command_id)
+            else:
+                # Late success. The sweep failed this row as "no audio" or
+                # "never picked up", yet the hub says the session worked — and
+                # if audio is on disk the sweep was simply wrong (it ran while
+                # the upload was still in flight, or before the stream closed).
+                # Restore it. With no bytes the sweep's verdict still stands.
+                cur.execute(
+                    """
+                    UPDATE hive_recordings
+                    SET status = 'ready', error = NULL
+                    WHERE command_id = %s AND device_id = %s
+                      AND status = 'failed'
+                      AND bytes > 0
+                      AND error IN (%s, %s);
+                    """,
+                    (command_id, device_id,
+                     SWEEP_NO_AUDIO_MSG, SWEEP_NEVER_PICKED_UP_MSG),
+                )
+                if cur.rowcount:
+                    logger.info("recording for command %s: late successful "
+                                "command result overruled the stale sweep",
+                                command_id)
             conn.commit()
 
 
@@ -316,9 +416,24 @@ def list_recordings(device_id: str, hive_index: Optional[int] = None,
     return [_row_to_dict(r) for r in rows]
 
 
+def normalise_gain(gain_db: Optional[int]) -> int:
+    """The gain a request is stored and sent with.
+
+    ``None`` (omitted) and ``GAIN_AUTO`` both mean automatic gain. Anything else
+    is a fixed gain, clamped to what a HiveInside 0.8.0 node accepts.
+    """
+    if gain_db is None or int(gain_db) == GAIN_AUTO:
+        return GAIN_AUTO
+    return max(GAIN_MIN_DB, min(GAIN_MAX_DB, int(gain_db)))
+
+
 def request_recording(device_id: str, hive_index: int, duration_s: float,
-                      gain_db: int = 0, requested_by: Optional[str] = None) -> dict:
+                      gain_db: Optional[int] = None,
+                      requested_by: Optional[str] = None) -> dict:
     """Create the row and queue the command that fills it.
+
+    ``gain_db`` omitted (or ``GAIN_AUTO``) asks the node to choose the gain;
+    otherwise it is a fixed gain of -20..+40 dB.
 
     Returns immediately — the hub only picks the command up on its next wake, so
     the caller gets a `requested` recording and polls it. Live listening is a
@@ -333,7 +448,7 @@ def request_recording(device_id: str, hive_index: int, duration_s: float,
             status_code=400,
             detail=f"duration must be between 0 (live) and {MAX_DURATION_S} seconds",
         )
-    gain_db = max(-20, min(20, int(gain_db)))
+    gain_db = normalise_gain(gain_db)
     ensure_device_config(device_id)
 
     duration_ds = int(round(duration_s * 10))
@@ -464,29 +579,51 @@ async def stream_recording(device_id: str, recording_id: int, request: Request):
     path.parent.mkdir(parents=True, exist_ok=True)
 
     written = 0
+    crc = 0
     truncated = False
+    disconnected = False
     with open(path, "wb") as fh:
-        async for chunk in request.stream():
-            if not chunk:
-                continue
-            if written + len(chunk) > MAX_RECORDING_BYTES:
-                # Keep what fits and stop reading. The node bounds itself at 60 s,
-                # so this only fires for a hub that has gone wrong — and half a
-                # recording plus an explicit note beats an unbounded write.
-                chunk = chunk[: max(0, MAX_RECORDING_BYTES - written)]
-                truncated = True
-            if chunk:
-                fh.write(chunk)
-                fh.flush()
-                written += len(chunk)
-            if truncated:
-                break
+        try:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                if written + len(chunk) > MAX_RECORDING_BYTES:
+                    # Keep what fits and stop reading. The node bounds itself at
+                    # 60 s, so this only fires for a hub that has gone wrong —
+                    # and half a recording plus an explicit note beats an
+                    # unbounded write.
+                    chunk = chunk[: max(0, MAX_RECORDING_BYTES - written)]
+                    truncated = True
+                if chunk:
+                    fh.write(chunk)
+                    fh.flush()
+                    written += len(chunk)
+                    crc = zlib.crc32(chunk, crc)
+                if truncated:
+                    break
+        except ClientDisconnect:
+            # The hub hung up before the body ended — or, behind a reverse
+            # proxy, simply did not wait for this response: Traefik cancels the
+            # upstream request (logging a 499) the moment its client goes, even
+            # after a complete body. A hub whose BLE session fails to start
+            # sends the terminating chunk and closes at once, so this is the
+            # ordinary shape of that failure, not a server fault.
+            #
+            # Letting it propagate cost twice: a traceback in the log for every
+            # failed session, and the byte count below never written, so audio
+            # that DID land before a mid-session drop was recorded as 0 bytes
+            # and later swept as "no audio arrived". Keep what arrived. The
+            # row's error is deliberately left alone: the hub's command result
+            # carries the real reason, and finalize_from_command_result only
+            # fills an error that is still empty.
+            disconnected = True
 
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE hive_recordings SET bytes = %s, filename = %s WHERE id = %s;",
-                (written, path.name, recording_id),
+                "UPDATE hive_recordings SET bytes = %s, server_crc32 = %s, "
+                "truncated = %s, filename = %s WHERE id = %s;",
+                (written, crc, truncated, path.name, recording_id),
             )
             if truncated:
                 cur.execute(
@@ -495,6 +632,11 @@ async def stream_recording(device_id: str, recording_id: int, request: Request):
                      recording_id),
                 )
             conn.commit()
+    if disconnected:
+        logger.warning("recording %s: hub disconnected after %s bytes",
+                       recording_id, written)
+        # Nobody is left to read this; it is returned for symmetry and tests.
+        return {"status": "disconnected", "bytes": written}
     logger.info("recording %s: received %s bytes%s", recording_id, written,
                 " (truncated)" if truncated else "")
     return {"status": "ok", "bytes": written}
@@ -511,6 +653,14 @@ def finalize_recording(device_id: str, recording_id: int,
     dashboard would show "recording…" forever.
     """
     status = "ready" if payload.ok else "failed"
+    # `bytes` defaults to 0 in the schema, so only a hub that actually sent it
+    # gets compared against what landed; a missing field is "unknown", not 0.
+    hub_bytes = payload.bytes if "bytes" in payload.model_fields_set else None
+    # A successful report retires a sweep's guess. The sweep may have closed
+    # this row while the session was still running, or just before this POST
+    # landed; its message would otherwise outlive the success that disproves
+    # it. Any other error — a server-side truncation, the hub's own reason —
+    # is a real observation and stays.
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -526,16 +676,20 @@ def finalize_recording(device_id: str, recording_id: int,
                     ring_overruns = %s,
                     ring_dropped_bytes = %s,
                     clipped_pct = %s,
+                    applied_gain_db = %s,
                     device_error = %s,
                     sample_rate = COALESCE(%s, sample_rate),
-                    error = COALESCE(%s, error)
+                    hub_bytes = %s,
+                    error = CASE WHEN %s AND error IN (%s, %s, %s) THEN %s
+                                 ELSE COALESCE(%s, error) END
                 WHERE id = %s AND device_id = %s;
                 """,
                 (status, payload.crc32, payload.device_bytes, payload.device_crc32,
                  payload.dropped_bytes, payload.gaps, payload.ring_overruns,
                  payload.ring_dropped_bytes, payload.clipped_pct,
-                 payload.device_error, payload.sample_rate, payload.error,
-                 recording_id, device_id),
+                 payload.applied_gain_db, payload.device_error,
+                 payload.sample_rate, hub_bytes, payload.ok, *SWEEP_MESSAGES, payload.error,
+                 payload.error, recording_id, device_id),
             )
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="recording not found")
@@ -618,8 +772,13 @@ def recording_wav(recording_id: int) -> StreamingResponse:
              dependencies=[Depends(require_api_key)])
 def queue_recording(device_id: str, slot: int = Query(1),
                     duration: float = Query(0.0),
-                    gain_db: int = Query(0)):
-    """Ask a hive for audio. `duration=0` is a live session (node-capped at 60 s)."""
+                    gain_db: Optional[int] = Query(None)):
+    """Ask a hive for audio. `duration=0` is a live session (node-capped at 60 s).
+
+    Omit `gain_db` (or send 127) for automatic gain; otherwise -20..+40 dB.
+    Nodes older than HiveInside 0.8.0 cap a fixed gain at +20 dB and treat
+    automatic as +20 dB.
+    """
     return request_recording(device_id, slot, duration, gain_db)
 
 

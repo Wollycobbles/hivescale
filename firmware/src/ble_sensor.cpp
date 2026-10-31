@@ -163,7 +163,13 @@ struct Parsed {
   float temp_c = NAN, humidity_pct = NAN, pressure_hpa = NAN;
   float ax = NAN, ay = NAN, az = NAN;        // HolyIot raw axes
   int   battery_pct = -1;
-  int   battery_mv  = -1;                     // HiveInside raw cell voltage (-1 = absent)
+  int   battery_mv  = -1;                     // raw cell voltage (HiveInside, RuuviTag; -1 = absent)
+  // RuuviTag diagnostics (see ruuvi_decode.h): the data format that decoded
+  // (3 = RAWv1, 5 = RAWv2; 0 = not a Ruuvi frame) and the RAWv2-only fields.
+  int   ruuvi_format = 0;
+  int   tx_power_dbm = INT_MIN;               // INT_MIN = absent (0 dBm is valid)
+  int   movement_count = -1;
+  long  sequence = -1;
   // HiveInside on-board FFT results.
   float accel_rms_mg = NAN, accel_peak_mg = NAN;
   float accel_band_swarm_mg = NAN, accel_band_fanning_mg = NAN, accel_band_activity_mg = NAN;
@@ -300,6 +306,15 @@ static Parsed parseRuuvi(const uint8_t* d, size_t len) {
   out.ay           = r.accel_y_mg;
   out.az           = r.accel_z_mg;
   out.battery_pct  = ruuvi::batteryPercent(r.battery_mv);
+  // The raw voltage too: the percent above is a coarse coin-cell estimate,
+  // and the backend already has a column for the voltage.
+  if (r.battery_mv > 0) out.battery_mv = r.battery_mv;
+  out.ruuvi_format = r.format;
+  if (r.format == 5) {
+    out.tx_power_dbm   = r.tx_power_dbm;
+    out.movement_count = r.movement_count;
+    out.sequence       = r.sequence;
+  }
   out.ok = true;
   return out;
 }
@@ -336,12 +351,12 @@ String normalizeMac(const String& raw) {
 
 #if HIVEINSIDE_GATT_CLIENT
 // ── address types learned from any scan this boot ──────────────────────────
-// The OTA relay needs a node's address type before it can connect, and used to
-// run a scan of its own to learn it. That scan is unsafe after the stack has
-// been torn down and re-initialised (see ble_stack.h), and it was also pure
-// duplication: the measurement scan earlier in the same cycle already saw the
-// node and captured exactly this. Keep it instead of throwing it away with the
-// per-slot accumulators. Plain RAM, so deep sleep clears it — which is correct,
+// The OTA and audio relays need a node's address type before they can connect;
+// the OTA relay used to run a scan of its own to learn it. That scan is unsafe
+// after the stack has been torn down and re-initialised (see ble_stack.h), and
+// it was also pure duplication: the measurement scan earlier in the same cycle
+// already saw the node and captured exactly this. Keep it instead of throwing it
+// away with the per-slot accumulators. Plain RAM, so deep sleep clears it — which is correct,
 // since a re-pairing between cycles must not be answered from a stale entry.
 struct AddrTypeEntry {
   String  mac;
@@ -364,6 +379,30 @@ bool recallAddrType(const String& mac, uint8_t& typeOut) {
 }
 #endif  // HIVEINSIDE_GATT_CLIENT
 
+#if HIVEINSIDE_AUDIO_ENABLED
+// ── HiveInside firmware versions learned from any scan this boot ───────────
+// The audio relay has to know whether a node is new enough (HiveInside 0.8.0)
+// for the applied-gain byte in its DATA header to mean anything. The
+// measurement scan learns that from the identity record, and then throws the
+// per-slot accumulators away long before checkCommands() runs a recording.
+// Kept here on the same terms as the address types above: plain RAM, cleared
+// by deep sleep, so a node reflashed between cycles is never answered from a
+// stale entry. A node whose identity was not heard this boot simply has no
+// entry, and the relay then reports no applied gain rather than a guessed one.
+struct FwVersionEntry {
+  String mac;
+  String version;
+};
+std::vector<FwVersionEntry> g_fwVersions;
+
+void rememberFirmwareVersion(const String& mac, const String& version) {
+  for (FwVersionEntry& e : g_fwVersions) {
+    if (e.mac == mac) { e.version = version; return; }
+  }
+  g_fwVersions.push_back(FwVersionEntry{mac, version});
+}
+#endif  // HIVEINSIDE_AUDIO_ENABLED
+
 // ── per-slot accumulator shared with the scan callback ─────────────────────
 struct Accumulator {
   String  mac;                 // normalized target MAC ("" = slot unused)
@@ -375,7 +414,11 @@ struct Accumulator {
   SensorType type = SensorType::None;
   int     rssi_dbm = 0;
   int     battery_pct = -1;
-  int     battery_mv  = -1;    // HiveInside raw cell voltage (-1 = absent)
+  int     battery_mv  = -1;    // raw cell voltage (HiveInside, RuuviTag; -1 = absent)
+  int     ruuvi_format = 0;    // RuuviTag diagnostics, see Parsed
+  int     tx_power_dbm = INT_MIN;
+  int     movement_count = -1;
+  long    sequence = -1;
   float   temp_c = NAN, humidity_pct = NAN, pressure_hpa = NAN;
   float   ax = NAN, ay = NAN, az = NAN;
   std::vector<float> magnitudes;  // |a| per advertisement (HolyIot AC RMS/peak)
@@ -478,6 +521,9 @@ class ScanCallbacks : public NimBLEScanCallbacks {
         if (g_slot[s].mac.length() == 0 || g_slot[s].mac != mac) continue;
         if (ident.board.length())      g_slot[s].board = ident.board;
         if (ident.fw_version.length()) g_slot[s].fw_version = ident.fw_version;
+#if HIVEINSIDE_AUDIO_ENABLED
+        if (ident.fw_version.length()) rememberFirmwareVersion(mac, ident.fw_version);
+#endif
       }
     }
 
@@ -536,6 +582,11 @@ class ScanCallbacks : public NimBLEScanCallbacks {
             a.battery_pct = (uint8_t)sd[8];
         }
         if (p.battery_pct >= 0)     a.battery_pct  = p.battery_pct;
+        if (p.battery_mv >= 0)      a.battery_mv   = p.battery_mv;
+        if (p.ruuvi_format)         a.ruuvi_format = p.ruuvi_format;
+        if (p.tx_power_dbm != INT_MIN) a.tx_power_dbm = p.tx_power_dbm;
+        if (p.movement_count >= 0)  a.movement_count = p.movement_count;
+        if (p.sequence >= 0)        a.sequence     = p.sequence;
         if (!isnan(p.temp_c))       a.temp_c       = p.temp_c;
         if (!isnan(p.humidity_pct)) a.humidity_pct = p.humidity_pct;
         if (!isnan(p.pressure_hpa)) a.pressure_hpa = p.pressure_hpa;
@@ -593,6 +644,10 @@ static void copyToSnapshot(const Accumulator& a, Snapshot& s) {
   s.rssi_dbm     = a.rssi_dbm;
   s.battery_pct  = a.battery_pct;
   s.battery_mv   = a.battery_mv;
+  s.ruuvi_format   = a.ruuvi_format;
+  s.tx_power_dbm   = a.tx_power_dbm;
+  s.movement_count = a.movement_count;
+  s.sequence       = a.sequence;
   s.temp_c       = a.temp_c;
   s.humidity_pct = a.humidity_pct;
   s.pressure_hpa = a.pressure_hpa;
@@ -796,6 +851,13 @@ void writeSnapshotToHive(JsonObject hive, const Snapshot& snap) {
   if (!isnan(snap.accel_z_mg))   ble["accel_z_mg"]       = snap.accel_z_mg;
   if (snap.battery_pct >= 0)     ble["battery_percent"]  = snap.battery_pct;
   if (snap.battery_mv >= 0)      ble["battery_mv"]       = snap.battery_mv;
+  // RuuviTag diagnostics: which data format the tag sends, and for RAWv2 its
+  // transmit power, movement counter and measurement sequence (a gap in the
+  // sequence = advertisements the hub missed).
+  if (snap.ruuvi_format)                ble["data_format"]    = snap.ruuvi_format;
+  if (snap.tx_power_dbm != INT_MIN)     ble["tx_power_dbm"]   = snap.tx_power_dbm;
+  if (snap.movement_count >= 0)         ble["movement_count"] = snap.movement_count;
+  if (snap.sequence >= 0)               ble["sequence"]       = snap.sequence;
   ble["rssi_dbm"] = snap.rssi_dbm;
   if (snap.fw_version.length())  ble["firmware_version"] = snap.fw_version;
   if (snap.board.length())       ble["board"]            = snap.board;
@@ -903,6 +965,16 @@ bool locateByScan(const String& mac, uint8_t& addrTypeOut) {
 }
 
 #endif  // HIVEINSIDE_OTA_ENABLED || HIVEINSIDE_AUDIO_ENABLED
+
+#if HIVEINSIDE_AUDIO_ENABLED
+String knownFirmwareVersion(const String& mac) {
+  const String m = normalizeMac(mac);
+  for (const FwVersionEntry& e : g_fwVersions) {
+    if (e.mac == m) return e.version;
+  }
+  return String();
+}
+#endif  // HIVEINSIDE_AUDIO_ENABLED
 
 }  // namespace blesensor
 

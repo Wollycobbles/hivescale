@@ -1,6 +1,7 @@
 """Database pool, connection helper and schema bootstrap (init_db)."""
 
 import hashlib
+import logging
 
 from psycopg_pool import ConnectionPool
 
@@ -65,6 +66,10 @@ def init_db():
                 ALTER TABLE device_channels
                     ADD CONSTRAINT device_channels_channel_number_check
                     CHECK (channel_number BETWEEN 1 AND 18);
+                -- The HivePal hive each slot is linked to, so the link survives
+                -- a rename. See migrations/031_device_channel_hive_links.sql.
+                ALTER TABLE device_channels
+                    ADD COLUMN IF NOT EXISTS hivepal_hive_id TEXT;
 
                 CREATE TABLE IF NOT EXISTS measurements (
                     id BIGSERIAL PRIMARY KEY,
@@ -199,6 +204,10 @@ def init_db():
                 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS sd_ok BOOLEAN;
                 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS rtc_ok BOOLEAN;
                 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS sht_ok BOOLEAN;
+                -- Sent by the hub firmware for a long time but dropped at ingest
+                -- until migration 034.
+                ALTER TABLE measurements ADD COLUMN IF NOT EXISTS sht_detected BOOLEAN;
+                ALTER TABLE measurements ADD COLUMN IF NOT EXISTS ambient_pressure_hpa DOUBLE PRECISION;
                 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS scale_1_raw BIGINT;
                 ALTER TABLE measurements ADD COLUMN IF NOT EXISTS scale_2_raw BIGINT;
                 -- mic columns (idempotent for existing deployments)
@@ -676,6 +685,27 @@ def init_db():
                 ALTER TABLE hive_recordings
                     ADD COLUMN IF NOT EXISTS ring_dropped_bytes BIGINT NOT NULL DEFAULT 0;
 
+                -- The gain the node actually applied (HiveInside 0.8.0+ reports
+                -- it in every DATA header). `gain_db` keeps meaning "what was
+                -- requested" — 127 there is automatic gain — and this is what
+                -- the audio on disk was recorded with. NULL = unknown: node
+                -- older than 0.8.0, hub older than 0.33.0, or no audio arrived.
+                -- See migrations/035_recording_applied_gain.sql.
+                ALTER TABLE hive_recordings
+                    ADD COLUMN IF NOT EXISTS applied_gain_db INTEGER;
+
+                -- What the server itself received, so "verified" covers the
+                -- bytes on disk and not only the hub's and node's word for
+                -- them: the CRC computed while writing, the length the hub
+                -- says it sent, and whether the server's size cap cut it.
+                -- See migrations/036_recording_server_crc.sql.
+                ALTER TABLE hive_recordings
+                    ADD COLUMN IF NOT EXISTS server_crc32 BIGINT;
+                ALTER TABLE hive_recordings
+                    ADD COLUMN IF NOT EXISTS hub_bytes BIGINT;
+                ALTER TABLE hive_recordings
+                    ADD COLUMN IF NOT EXISTS truncated BOOLEAN NOT NULL DEFAULT false;
+
                 CREATE INDEX IF NOT EXISTS hive_recordings_device_idx
                     ON hive_recordings (device_id, requested_at DESC);
                 CREATE INDEX IF NOT EXISTS hive_recordings_hive_idx
@@ -748,6 +778,12 @@ def init_db():
                 ALTER TABLE dashboard_users
                     ADD COLUMN IF NOT EXISTS email TEXT;
 
+                -- Carried in every session token and checked on each request;
+                -- bumping it (password change) revokes the sessions issued
+                -- before. See migrations/033_dashboard_session_version.sql.
+                ALTER TABLE dashboard_users
+                    ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0;
+
                 -- Small key/value store for dashboard-wide settings, currently the
                 -- auto-generated session signing secret (so logins survive restarts
                 -- without requiring DASHBOARD_SESSION_SECRET to be configured).
@@ -801,3 +837,37 @@ def init_db():
                 """
             )
             conn.commit()
+
+            _ensure_dashboard_email_unique(cur)
+            conn.commit()
+
+
+def _ensure_dashboard_email_unique(cur) -> None:
+    """Make dashboard_users.email unique (case-insensitive, NULLs allowed).
+
+    The e-mail is the identity single sign-on maps to, so two accounts sharing
+    one would make an SSO login ambiguous. A database that already holds
+    duplicates cannot get the index: rather than refusing to start (and taking
+    measurement ingestion down with the dashboard), that is logged loudly, and
+    SSO refuses to sign in the duplicated addresses until they are fixed.
+    """
+    cur.execute(
+        """
+        SELECT lower(email), count(*) FROM dashboard_users
+        WHERE email IS NOT NULL AND email <> ''
+        GROUP BY lower(email) HAVING count(*) > 1;
+        """
+    )
+    dupes = cur.fetchall()
+    if dupes:
+        logging.getLogger("hivescale.db").error(
+            "dashboard_users: these email addresses are used by several accounts, so the "
+            "unique email index was NOT created and SSO sign-in is refused for them: %s. "
+            "Give each account its own address and restart.",
+            ", ".join(f"{e} ({n}x)" for e, n in dupes),
+        )
+        return
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS dashboard_users_email_lower_key "
+        "ON dashboard_users (lower(email)) WHERE email IS NOT NULL AND email <> '';"
+    )

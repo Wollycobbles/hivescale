@@ -81,6 +81,11 @@
 // #define WAKE_BUTTON_FROM_DEEP_SLEEP 0            // ignore the setup button as a wake source
 // #define MIN_DEEP_SLEEP_MS           (30UL*1000UL) // floor on a single sleep, in ms
 
+// XIAO ESP32-C6 only: optional external setup button between D0 and GND. A
+// press opens the provisioning AP (and wakes the hub to do it); it has no
+// long-press factory reset. See EXTERNAL_SETUP_BUTTON_PIN in config.h.
+// #define ENABLE_EXTERNAL_SETUP_BUTTON 1
+
 // ==============================
 // INMP441 STEREO MICROPHONES
 // ==============================
@@ -172,8 +177,9 @@
 // MULTI-HIVE PRE-SEED (optional, up to 16 hives)
 // ==============================
 // Firmware v0.20.0+ generalises HiveHub to a dynamic registry of up to
-// MAX_HIVES hives (16 supported wired scales), each with one scale source and at most one in-hive
-// sensor — see hive_config.h and docs/multi-hive.md. The provisioning portal
+// MAX_HIVES hives (16 supported wired scales), each with one scale source and up
+// to three in-hive sensors, one per lane (beacon or DS18B20, counter, heart) —
+// see ble_lanes.h, hive_config.h and docs/multi-hive.md. The provisioning portal
 // (hold the setup button after flashing) configures this registry directly and
 // is the recommended way to set it up. To pre-seed it from secrets.h instead
 // (so a device already knows every hive on FIRST BOOT, before ever visiting

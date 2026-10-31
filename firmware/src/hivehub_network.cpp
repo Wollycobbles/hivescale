@@ -370,7 +370,9 @@ bool uploadCachedLines() {
   }
 
   bool encounteredFailure = false;
+  bool writeFailed = false;
   bool hitUploadLimit = false;
+  size_t bytesWritten = 0;
   int total = 0;
   int uploaded = 0;
   int kept = 0;
@@ -406,16 +408,40 @@ bool uploadCachedLines() {
     }
 
     kept++;
+    // println adds "\r\n". Anything short of the full line — not just zero
+    // bytes — means a full or failing card, and the temp file can no longer
+    // stand in for the queue.
     size_t written = out.println(line);
-    if (written == 0) {
-      Serial.println("[CACHE] Failed to write retained line to temp cache");
-      encounteredFailure = true;
+    bytesWritten += written;
+    if (written != line.length() + 2) {
+      Serial.printf("[CACHE] Short write to temp cache (%u of %u bytes)\n",
+                    (unsigned)written, (unsigned)(line.length() + 2));
+      writeFailed = true;
+      break;
     }
   }
 
   in.close();
   out.flush();
   out.close();
+
+  // flush()/close() report nothing, so confirm on the card that everything
+  // the loop wrote actually landed before the temp file may replace the queue.
+  if (!writeFailed && kept > 0 && sdFileSize(TEMP_FILE) != bytesWritten) {
+    Serial.printf("[CACHE] Temp cache holds %u of %u bytes after close\n",
+                  (unsigned)sdFileSize(TEMP_FILE), (unsigned)bytesWritten);
+    writeFailed = true;
+  }
+
+  if (writeFailed) {
+    // Keep the old queue exactly as it was. Lines uploaded during this pass
+    // stay in it and are replayed next time, which is safe: each carries a
+    // stable measurement_id and the server de-duplicates it.
+    SD.remove(TEMP_FILE);
+    Serial.printf("[CACHE] Retry queue left unchanged after a write failure (uploaded %d this pass)\n",
+                  uploaded);
+    return false;
+  }
 
   if (kept > 0) {
     // Never delete the old queue before its replacement is durable. FAT lacks
@@ -1172,6 +1198,36 @@ static bool relayAudioSession(const String& mac, long recordingId,
 
   heapdiag::probe("audio-start");
 
+  // The SOCKET goes up before the radio, and that order is load-bearing.
+  //
+  // 0.30.6 tried it the other way, reasoning that the BT controller is the one
+  // allocation here that can neither shrink nor be retried, so it should get
+  // first refusal. The field disproved it in one cycle: the radio started and
+  // the handshake underneath it did not, with
+  //
+  //     "TLS connect to the backend failed"   1.28 s from claim to result
+  //
+  // against a 15 s connect timeout — an allocation that failed before anything
+  // touched the network, not a slow or degraded link. (The same cycle then
+  // completed a TLS handshake to the same host to REPORT that failure, once
+  // the radio had been released again.)
+  //
+  // The reasoning was wrong about which constraint binds. The controller needs
+  // a large total in many pieces; mbedtls needs CONTIGUITY, and on this
+  // framework it needs a lot of it: CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN is
+  // 16384 with CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN unset, so a session wants
+  // TWO 16 kB contiguous record buffers and neither of them may be the small
+  // one. Contiguity is what fragmentation destroys first, so whichever of the
+  // two runs second, mbedtls suffers far worse for it. The 0.30.4 log said as
+  // much before anyone read it that way: once the controller had taken its
+  // share, `largest` had collapsed to 13812 — under one record buffer.
+  //
+  // So the fragile allocation goes first and the robust one takes what is
+  // left. Getting both to fit at all is a separate problem, addressed by
+  // lowering the peak rather than by reordering it: the mic I2S channel is
+  // freed at the measurement now (sensors.cpp) and esp32dev asks for a smaller
+  // NimBLE mbuf pool (platformio.ini). Do not re-reorder this without a field
+  // log showing the handshake surviving underneath a live controller.
   WiFiClientSecure secureClient;
   WiFiClient plainClient;
   WiFiClient* sock = nullptr;
@@ -1200,7 +1256,13 @@ static bool relayAudioSession(const String& mac, long recordingId,
     secureClient.setConnectionTimeout(HTTP_REQUEST_TIMEOUT_MS);
     secureClient.setTimeout(HTTP_REQUEST_TIMEOUT_MS);
     if (!secureClient.connect(host.c_str(), port)) {
+      // Say what the heap looked like. This is the failure 0.30.6 produced in
+      // the field, and it was diagnosed from command timestamps in the backend
+      // rather than from this line, because this line did not carry a number.
       setMsg("TLS connect to the backend failed");
+      Serial.printf("[HI-AUD] TLS connect to the backend failed "
+                    "(free heap %u, largest block %u)\n",
+                    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
       return false;
     }
     sock = &secureClient;
@@ -1258,8 +1320,14 @@ static bool relayAudioSession(const String& mac, long recordingId,
 
   bool bleOk = gattaudio::begin(mac, durationDs, gainDb);
   if (!bleOk) {
-    setMsg(gattaudio::lastError().length() ? gattaudio::lastError()
-                                           : String("audio session failed to start"));
+    // Carry the heap numbers into the command result, not just onto serial.
+    // Every start failure on the 30-pin ESP32 so far has been a memory
+    // question, and the dashboard is the only place a field tester sees.
+    const String why = gattaudio::lastError().length()
+                           ? gattaudio::lastError()
+                           : String("audio session failed to start");
+    setMsg(why + " [heap free " + ESP.getFreeHeap() + ", largest " +
+           ESP.getMaxAllocHeap() + ", min " + ESP.getMinFreeHeap() + "]");
     // Close the body cleanly anyway: the backend then sees a zero-byte
     // recording it can mark failed, instead of a half-open socket it has to
     // time out.
@@ -1421,6 +1489,24 @@ static bool relayAudioSession(const String& mac, long recordingId,
   fin["sample_rate"] = stats.sampleRate ? stats.sampleRate : 16000;
   fin["clipped_pct"] = stats.clippedPct;
   fin["device_error"] = stats.error;
+  // The gain the node applied (HiveInside 0.8.0+, the counterpart of an auto
+  // request). Only trustworthy from 0.8.0 on: older nodes send 0 in that byte
+  // whatever gain they applied, which would read as a false "0 dB". The node's
+  // version comes from its identity record in this boot's scan; unknown means
+  // the field is left out and the backend stores NULL, never a guess.
+  {
+#if ENABLE_BLE_SCAN
+    const String nodeFw = blesensor::knownFirmwareVersion(mac);
+#else
+    const String nodeFw;
+#endif
+    if (hiaudio::appliedGainReportable(stats.headerGain, nodeFw.c_str())) {
+      fin["applied_gain_db"] = (int)stats.headerGain.gainDb;
+    } else if (stats.headerGain.seen) {
+      Serial.printf("[HI-AUD] applied gain not reported (node firmware %s)\n",
+                    nodeFw.length() ? nodeFw.c_str() : "unknown this boot");
+    }
+  }
 
   String reason;
   bool ok = sessionOk && !socketLost && !stalled &&
@@ -1571,7 +1657,7 @@ static void reportInterruptedRelay() {
   postCommandResult(commandId, false, msg);
 }
 
-void postCommandResult(int commandId, bool success, const String& message) {
+bool postCommandResult(int commandId, bool success, const String& message) {
   JsonDocument result;
   result["success"] = success;
   result["message"] = message;
@@ -1579,7 +1665,77 @@ void postCommandResult(int commandId, bool success, const String& message) {
   String payload;
   serializeJson(result, payload);
 
-  httpPostJson(apiUrl(String("/api/v1/devices/") + deviceId + "/commands/" + commandId + "/result"), payload);
+  return httpPostJson(apiUrl(String("/api/v1/devices/") + deviceId + "/commands/" +
+                             commandId + "/result"),
+                      payload);
+}
+
+// ---- Relay results that must not be lost ----------------------------------
+//
+// A relay's command result is the only report the backend reliably acts on
+// (see finalize_from_command_result() on the server), and it is posted at the
+// worst moment of the cycle: straight after a BLE session, with the heap at its
+// most fragmented. PR 198's field test on a 30-pin ESP32 showed the cost — the
+// session failed, its one result POST evidently failed too, and the dashboard
+// got the backend's five-minute guess ("the hub started uploading but no audio
+// arrived") instead of the hub's actual reason.
+//
+// So retry once after a pause (the BLE host has fully released by then, and the
+// TLS session from the upload has been torn down), and if that fails as well,
+// keep the result in RTC memory and deliver it at the top of the next cycle,
+// before anything new is claimed. Bounded, so a backend that keeps rejecting it
+// cannot pin the slot forever.
+static const uint32_t PENDING_RESULT_MAGIC = 0x48505253UL;  // "HPRS"
+static const uint32_t PENDING_RESULT_MAX_TRIES = 3;
+static const uint32_t RELAY_RESULT_RETRY_DELAY_MS = 1500;
+
+static void clearPendingResult() {
+  rtcPendingResultMagic = 0;
+  rtcPendingResultCommandId = 0;
+  rtcPendingResultTries = 0;
+  rtcPendingResultMsg[0] = '\0';
+}
+
+static void stashPendingResult(int commandId, bool success, const String& message) {
+  rtcPendingResultCommandId = (uint32_t)commandId;
+  rtcPendingResultSuccess = success ? 1 : 0;
+  rtcPendingResultTries = 0;
+  strlcpy(rtcPendingResultMsg, message.c_str(), sizeof(rtcPendingResultMsg));
+  rtcPendingResultMagic = PENDING_RESULT_MAGIC;  // last: makes the record valid
+}
+
+static void postRelayResult(int commandId, bool success, const String& message) {
+  if (postCommandResult(commandId, success, message)) return;
+
+  Serial.printf("[CMD] result for command %d did not post (free heap %u, largest "
+                "block %u); retrying in %u ms\n",
+                commandId, (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap(),
+                (unsigned)RELAY_RESULT_RETRY_DELAY_MS);
+  delay(RELAY_RESULT_RETRY_DELAY_MS);
+  if (postCommandResult(commandId, success, message)) return;
+
+  Serial.printf("[CMD] result for command %d kept for the next cycle\n", commandId);
+  stashPendingResult(commandId, success, message);
+}
+
+// Deliver a result an earlier cycle could not. Called once per cycle, before
+// the next command is fetched.
+static void reportPendingResult() {
+  if (rtcPendingResultMagic != PENDING_RESULT_MAGIC || rtcPendingResultCommandId == 0)
+    return;
+  rtcPendingResultMsg[sizeof(rtcPendingResultMsg) - 1] = '\0';
+  const int commandId = (int)rtcPendingResultCommandId;
+  Serial.printf("[CMD] Delivering held result for command %d\n", commandId);
+  if (postCommandResult(commandId, rtcPendingResultSuccess != 0,
+                        String(rtcPendingResultMsg))) {
+    clearPendingResult();
+    return;
+  }
+  if (++rtcPendingResultTries >= PENDING_RESULT_MAX_TRIES) {
+    Serial.printf("[CMD] giving up on the held result for command %d\n", commandId);
+    clearPendingResult();
+  }
 }
 
 // Claim and run at most one queued command. Returns true when one ran, and
@@ -1681,7 +1837,8 @@ static bool runOneCommand(bool* wasAudio) {
 #if HIVEINSIDE_AUDIO_ENABLED
   else if (type == "record_audio") {
     // payload: { "slot": 1..MAX_HIVES, "recording_id": <int>,
-    //            "duration_ds": <0 = live/open-ended>, "gain_db": <-20..20> }
+    //            "duration_ds": <0 = live/open-ended>,
+    //            "gain_db": <-20..40, or 127 = automatic (HiveInside 0.8.0+)> }
     //
     // No URL in the payload — the upload target is derived from this hub's own
     // device id (see relayAudioSession). Microphone audio must never be posted
@@ -1705,10 +1862,10 @@ static bool runOneCommand(bool* wasAudio) {
       bool ok = recordHiveInsideAudio(mac, recordingId, durationDs, gainDb, &resultMsg);
       clearRelayInFlight();
       if (wasAudio) *wasAudio = ok;
-      postCommandResult(commandId, ok,
-                        resultMsg.length() ? resultMsg
-                                           : (ok ? "audio session completed"
-                                                 : "audio session failed"));
+      postRelayResult(commandId, ok,
+                      resultMsg.length() ? resultMsg
+                                         : (ok ? "audio session completed"
+                                               : "audio session failed"));
     }
   }
 #else
@@ -1802,8 +1959,10 @@ static bool runOneCommand(bool* wasAudio) {
 void checkCommands() {
   if (!connectNetwork()) return;
 
-  // Close out a relay that a reset interrupted before claiming anything new.
+  // Close out a relay that a reset interrupted, and deliver a result an
+  // earlier cycle could not post, before claiming anything new.
   reportInterruptedRelay();
+  reportPendingResult();
 
   bool wasAudio = false;
   if (!runOneCommand(&wasAudio)) return;
